@@ -646,6 +646,14 @@ def test_server_rowcount(scur: snowflake.connector.cursor.SnowflakeCursor):
     assert cur.rowcount == 2
 
 
+def test_server_execute_task_runs_body(scur: snowflake.connector.cursor.SnowflakeCursor):
+    scur.execute("create table t (v int)")
+    scur.execute("create task tk as insert into t values (1)")
+    scur.execute("execute task tk")
+    scur.execute("select v from t")
+    assert scur.fetchall() == [(1,)]
+
+
 @pytest.mark.parametrize(
     "sql",
     [

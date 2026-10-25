@@ -11,6 +11,16 @@ _SCHEMA_EXISTS_SQL = """
 """
 
 
+def check_schema_exists(duck_conn: DuckDBPyConnection, database: str | None, schema: str | None) -> None:
+    """Raise Snowflake's error if the schema doesn't exist."""
+    if not duck_conn.execute(_SCHEMA_EXISTS_SQL, [database, schema]).fetchone():
+        raise snowflake.connector.errors.ProgrammingError(
+            msg=f"SQL compilation error:\nSchema '{database}.{schema}' does not exist or not authorized.",
+            errno=2003,
+            sqlstate="02000",
+        )
+
+
 def temporary_objects(
     expression: Expr,
     temporaries: TemporaryObjects,
@@ -36,13 +46,8 @@ def temporary_objects(
         and (table := expression.find(exp.Table))
     ):
         owner = (table.catalog or current_database, table.db or current_schema)
-        if not duck_conn.execute(_SCHEMA_EXISTS_SQL, list(owner)).fetchone():
-            # DuckDB would create it in temp.main whether or not its schema exists
-            raise snowflake.connector.errors.ProgrammingError(
-                msg=f"SQL compilation error:\nSchema '{owner[0]}.{owner[1]}' does not exist or not authorized.",
-                errno=2003,
-                sqlstate="02000",
-            )
+        # DuckDB would create it in temp.main whether or not its schema exists
+        check_schema_exists(duck_conn, *owner)
         if (existing := temporaries.owner(table.name)) and existing != owner:
             # DuckDB names temporary objects without their schema, so this one would replace or clash with the other
             raise NotImplementedError("Temporary objects with the same name in different schemas")

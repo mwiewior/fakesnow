@@ -5,7 +5,7 @@ import secrets
 from collections.abc import Iterable
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import snowflake.connector
 from duckdb import DuckDBPyConnection
@@ -22,6 +22,12 @@ from fakesnow.temporary import TemporaryObjects
 from fakesnow.transforms.stage import TableStages
 from fakesnow.variables import Variables
 
+if TYPE_CHECKING:
+    from fakesnow.instance import FakeSnow
+    from fakesnow.tasks.functions import TaskRunContext
+
+NO_INSTANCE = "Running tasks needs a connection from fakesnow.patch or fakesnow.server"
+
 
 class FakeSnowflakeConnection:
     def __init__(
@@ -35,6 +41,7 @@ class FakeSnowflakeConnection:
         db_path: str | os.PathLike | None = None,
         nop_regexes: list[str] | None = None,
         owners: Owners | None = None,
+        instance: FakeSnow | None = None,
         *args: Any,
         **kwargs: Any,
     ):
@@ -56,6 +63,8 @@ class FakeSnowflakeConnection:
         self.warehouse: str | None = (w := kwargs.get("warehouse")) and normalise_ident(w)
         # as the connector's, eg: for SYSTEM$CANCEL_ALL_QUERIES(<session id>)
         self.session_id: int = secrets.randbelow(10**10)
+        # recorded as the user who created or ran a task
+        self.user: str | None = (u := kwargs.get("user")) and normalise_ident(u)
 
         self.database_set = False
         self.schema_set = False
@@ -70,6 +79,9 @@ class FakeSnowflakeConnection:
         self._autocommit = kwargs.get("autocommit", True)
         self.query_tag: str = (kwargs.get("session_parameters") or {}).get("QUERY_TAG") or ""
         self._in_transaction = False
+        self._instance = instance
+        # the task run this session was opened for, if any
+        self.task_context: TaskRunContext | None = None
 
         # create database if needed
         if (
@@ -184,6 +196,22 @@ class FakeSnowflakeConnection:
 
     def is_closed(self) -> bool:
         return self._is_closed
+
+    def open_session(
+        self, database: str, schema: str, role: str, warehouse: str | None, session_parameters: dict[str, str]
+    ) -> FakeSnowflakeConnection:
+        """Open a new session on the same instance, with its own current database, schema, role, warehouse and
+        transaction."""
+        if self._instance is None:
+            raise NotImplementedError(NO_INSTANCE)
+        session = self._instance.connect(
+            database, schema, nop_regexes=self.nop_regexes, role=role, session_parameters=session_parameters
+        )
+        # as given, not normalised again, so a quoted name keeps its case
+        session.database, session._schema, session.role = database, schema, role  # noqa: SLF001
+        session.warehouse = warehouse
+        session.user = self.user
+        return session
 
     def rollback(self) -> None:
         self.cursor().execute("ROLLBACK")

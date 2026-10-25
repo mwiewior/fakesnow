@@ -267,6 +267,90 @@ create table if not exists ${catalog}._fs_information_schema._fs_load_history (
     """
 )
 
+# predecessors and finalize hold unqualified names of tasks in the same schema
+SQL_CREATE_TASKS_TABLE = Template(
+    """
+create table if not exists ${catalog}._fs_information_schema._fs_tasks (
+    created_on TIMESTAMPTZ,
+    name VARCHAR,
+    id VARCHAR,
+    schema_name VARCHAR,
+    owner VARCHAR,
+    comment VARCHAR,
+    warehouse VARCHAR,
+    schedule VARCHAR,
+    predecessors VARCHAR[],
+    state VARCHAR,
+    definition VARCHAR,
+    condition VARCHAR,
+    finalize VARCHAR,
+    config VARCHAR,
+    error_integration VARCHAR,
+    success_integration VARCHAR,
+    overlap_policy VARCHAR,
+    allow_overlapping_execution BOOLEAN,
+    properties JSON,
+    session_parameters JSON,
+    last_committed_on TIMESTAMPTZ,
+    last_suspended_on TIMESTAMPTZ,
+    last_suspended_reason VARCHAR,
+    created_by_user VARCHAR,
+    PRIMARY KEY (schema_name, name)
+)
+    """
+)
+
+# one row per task run by a graph run, the source of TASK_HISTORY. upper case column names are those of its result.
+SQL_CREATE_TASK_HISTORY_TABLE = Template(
+    """
+create table if not exists ${catalog}._fs_information_schema._fs_task_history (
+    QUERY_ID VARCHAR,
+    NAME VARCHAR,
+    SCHEMA_NAME VARCHAR,
+    QUERY_TEXT VARCHAR,
+    CONDITION_TEXT VARCHAR,
+    STATE VARCHAR,
+    ERROR_CODE INTEGER,
+    ERROR_MESSAGE VARCHAR,
+    SCHEDULED_TIME TIMESTAMPTZ,
+    QUERY_START_TIME TIMESTAMPTZ,
+    COMPLETED_TIME TIMESTAMPTZ,
+    ROOT_TASK_ID VARCHAR,
+    RUN_ID BIGINT,
+    RETURN_VALUE VARCHAR,
+    SCHEDULED_FROM VARCHAR,
+    ATTEMPT_NUMBER INTEGER,
+    CONFIG VARCHAR,
+    GRAPH_RUN_GROUP_ID VARCHAR,
+    SCHEDULED_BY_USER VARCHAR
+)
+    """
+)
+
+# one row per graph run, the source of COMPLETE_TASK_GRAPHS. upper case column names are those of its result.
+SQL_CREATE_TASK_GRAPH_RUNS_TABLE = Template(
+    """
+create table if not exists ${catalog}._fs_information_schema._fs_task_graph_runs (
+    ROOT_TASK_NAME VARCHAR,
+    SCHEMA_NAME VARCHAR,
+    STATE VARCHAR,
+    SCHEDULED_FROM VARCHAR,
+    FIRST_ERROR_TASK_NAME VARCHAR,
+    FIRST_ERROR_CODE INTEGER,
+    FIRST_ERROR_MESSAGE VARCHAR,
+    SCHEDULED_TIME TIMESTAMPTZ,
+    QUERY_START_TIME TIMESTAMPTZ,
+    COMPLETED_TIME TIMESTAMPTZ,
+    ROOT_TASK_ID VARCHAR,
+    RUN_ID BIGINT,
+    ATTEMPT_NUMBER INTEGER,
+    CONFIG VARCHAR,
+    GRAPH_RUN_GROUP_ID VARCHAR,
+    SCHEDULED_BY_USER VARCHAR
+)
+    """
+)
+
 
 SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_STAGES_TABLE = """
 CREATE TABLE IF NOT EXISTS _fs_global._fs_information_schema._fs_stages (
@@ -314,6 +398,9 @@ def per_db_creation_sql(catalog: str) -> str:
         {SQL_CREATE_INFORMATION_SCHEMA_SCHEMATA_VIEW.substitute(catalog=catalog)};
         {SQL_CREATE_INFORMATION_SCHEMA_VIEWS_VIEW.substitute(catalog=catalog)};
         {SQL_CREATE_LOAD_HISTORY_TABLE.substitute(catalog=catalog)};
+        {SQL_CREATE_TASKS_TABLE.substitute(catalog=catalog)};
+        {SQL_CREATE_TASK_HISTORY_TABLE.substitute(catalog=catalog)};
+        {SQL_CREATE_TASK_GRAPH_RUNS_TABLE.substitute(catalog=catalog)};
     """
 
 
@@ -325,7 +412,9 @@ def fs_global_creation_sql() -> str:
         {SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW};
         {SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_USERS_TABLE};
         {SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_STAGES_TABLE};
-        {SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_FILE_FORMATS_TABLE}
+        {SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_FILE_FORMATS_TABLE};
+        -- always empty, so an account-wide SHOW TASKS has a table to list when no database has one
+        {SQL_CREATE_TASKS_TABLE.substitute(catalog="_fs_global")}
     """
 
 

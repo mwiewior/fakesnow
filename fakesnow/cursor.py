@@ -26,6 +26,7 @@ import fakesnow.checks as checks
 import fakesnow.expr as expr
 import fakesnow.info_schema as info_schema
 import fakesnow.macros as macros
+import fakesnow.tasks as tasks
 import fakesnow.transforms as transforms
 from fakesnow import logger
 from fakesnow.copy_into import copy_into
@@ -211,7 +212,9 @@ class FakeSnowflakeCursor:
                 p = params or kwargs.get("binding_params")
                 print(f"{command};params={p}" if p else f"{command};", file=sys.stderr)
 
-            command = self._inline_variables(command)
+            # a task body keeps its session variables, which are resolved when it runs
+            if "$" not in command or not tasks.keeps_variables(command):
+                command = self._inline_variables(command)
             if kwargs.get("binding_params"):
                 # params have come via the server
                 params = kwargs["binding_params"]
@@ -288,23 +291,19 @@ class FakeSnowflakeCursor:
         no_database, no_schema = checks.is_unqualified_table_expression(expression)
 
         if no_database and not self._conn.database_set:
-            cmd = expr.key_command(expression)
-            raise snowflake.connector.errors.ProgrammingError(
-                msg=f"Cannot perform {cmd}. This session does not have a current database. Call 'USE DATABASE', or use a qualified name.",  # noqa: E501
-                errno=90105,
-                sqlstate="22000",
-            )
+            raise checks.no_current_database_error(expr.key_command(expression))
         elif no_schema and not self._conn.schema_set:
-            cmd = expr.key_command(expression)
-            raise snowflake.connector.errors.ProgrammingError(
-                msg=f"Cannot perform {cmd}. This session does not have a current schema. Call 'USE SCHEMA', or use a qualified name.",  # noqa: E501
-                errno=90106,
-                sqlstate="22000",
-            )
+            raise checks.no_current_schema_error(expr.key_command(expression))
 
     def _transform(self, expression: Expr, params: MutableParams | None) -> Expr:
         return (
             expression.transform(lambda e: transforms.identifier(e, params), copy=False)
+            .transform(tasks.task_statement, copy=False)
+            .transform(lambda e: tasks.task_functions(e, self._conn.task_context), copy=False)
+            .transform(
+                lambda e: tasks.task_table_functions(e, self._duck_conn, self._conn.database, self._conn.schema),
+                copy=False,
+            )
             .transform(transforms.upper_case_unquoted_identifiers, copy=False)
             .transform(
                 lambda e: transforms.temporary_objects(
@@ -492,7 +491,13 @@ class FakeSnowflakeCursor:
 
         result_sql = None
 
-        if not self._conn._autocommit:
+        if tasks.commits_transaction(transformed):
+            # the task statement is written through a connection of its own, so the active transaction, explicit or
+            # implicit, is committed first, as Snowflake does
+            self._duck_conn.commit()
+            self._conn._in_transaction = False
+
+        elif not self._conn._autocommit:
             # Snowflake implicitly commits the active transaction before executing DDL statements
             # This will also cause the DDL statement to run in its own transaction and commit
             # see https://docs.snowflake.com/en/sql-reference/transactions#ddl
@@ -534,6 +539,10 @@ class FakeSnowflakeCursor:
                     self._conn.temporaries,
                     params,
                 )
+            elif task_statement := transformed.args.get("task_statement"):
+                sql = tasks.execute(task_statement, self._conn)
+                logger.log_sql(sql, params)
+                self._duck_conn.execute(sql)
             elif transformed.args.get("create_file_format_name"):
                 # File formats persist without committing the caller's DML. A separate DuckDB
                 # cursor uses an independent transaction, avoiding cross-database writes too.
@@ -666,6 +675,8 @@ class FakeSnowflakeCursor:
                 database = table.catalog or self._conn.database
                 assert database
                 schema = table.db
+                if transformed.args.get("replace"):
+                    tasks.drop_schema(self._duck_conn, database, schema)
                 self._duck_conn.execute(f"SET schema='{database}.{schema}'")
                 self._conn.database = database
                 self._conn.database_set = True
@@ -699,6 +710,10 @@ class FakeSnowflakeCursor:
 
             elif cmd.startswith("DROP") and ident:
                 result_sql = SQL_DROPPED.substitute(name=_escape_literal(ident))
+
+                table = transformed.find(exp.Table)
+                if cmd == "DROP SCHEMA" and table and table.db and (table.catalog or self._conn.database):
+                    tasks.drop_schema(self._duck_conn, table.catalog or cast(str, self._conn.database), table.db)
 
                 # if dropping the current database/schema then reset conn metadata
                 if cmd == "DROP DATABASE" and ident == self._conn.database:

@@ -2,6 +2,16 @@ from __future__ import annotations
 
 from sqlglot import Expr, exp
 
+from fakesnow.tasks.statements import (
+    AlterTask,
+    CreateTask,
+    DescribeTask,
+    DropTask,
+    EnableDependents,
+    ExecuteTask,
+    ShowTasks,
+)
+
 # Statement type ids returned by Snowflake as statementTypeId.
 # Clients use them to tell whether a statement produces a result set, eg: the JDBC driver
 # rejects executeUpdate for statements it can't identify, and the python connector uses
@@ -47,6 +57,17 @@ _EXPRESSION_TYPES: dict[type[Expr], int] = {
 }
 
 
+_TASK_STATEMENT_TYPES: dict[type, int] = {
+    CreateTask: DDL,
+    AlterTask: DDL,
+    DropTask: DDL,
+    ShowTasks: SHOW,
+    DescribeTask: DESCRIBE,
+    ExecuteTask: UNKNOWN,
+    EnableDependents: SELECT,
+}
+
+
 def statement_type_id(expression: Expr) -> int:
     """The Snowflake statement type id for an expression.
 
@@ -62,5 +83,8 @@ def statement_type_id(expression: Expr) -> int:
 
     if isinstance(expression, exp.Use):
         return USE
+
+    if (task_statement := expression.args.get("task_statement")) is not None:
+        return _TASK_STATEMENT_TYPES[type(task_statement)]
 
     return _EXPRESSION_TYPES.get(type(expression), UNKNOWN)

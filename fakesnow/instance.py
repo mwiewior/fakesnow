@@ -70,6 +70,7 @@ class FakeSnow:
                 db_path=self.db_path,
                 nop_regexes=nop_regexes or self.nop_regexes,
                 owners=self.owners,
+                instance=self,
                 **kwargs,
             )
             self._connections.add(conn)

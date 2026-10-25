@@ -770,3 +770,26 @@ def test_insert_overwrite(dcur: snowflake.connector.cursor.DictCursor):
 
     dcur.execute("SELECT a FROM example")
     assert dcur.fetchall() == [{"A": 3}]
+
+
+def test_use_role_changes_current_role(cur: snowflake.connector.cursor.SnowflakeCursor):
+    cur.execute("use role sysadmin")
+    assert cur.execute("select current_role()").fetchall() == [("SYSADMIN",)]
+
+
+def test_use_warehouse_changes_current_warehouse(cur: snowflake.connector.cursor.SnowflakeCursor):
+    # assumes COMPUTE_WH exists, as it does in a new Snowflake account. fakesnow treats every warehouse as existing.
+    cur.execute("use warehouse compute_wh")
+    assert cur.execute("select current_warehouse()").fetchall() == [("COMPUTE_WH",)]
+
+
+def test_system_cancel_all_queries(conn: snowflake.connector.SnowflakeConnection):
+    # as dbt calls it, with the session's own id, when it's interrupted
+    with conn.cursor() as cur:
+        cur.execute(f"select system$cancel_all_queries({conn.session_id})")
+        assert cur.fetchall() == [("0 cancelled.",)]
+
+
+def test_system_cancel_all_queries_of_another_session(cur: snowflake.connector.cursor.SnowflakeCursor):
+    cur.execute("select system$cancel_all_queries(1234)")
+    assert cur.fetchall() == [("invalid session id",)]

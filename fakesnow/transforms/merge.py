@@ -10,7 +10,48 @@ def merge(merge_expr: Expr) -> list[Expr]:
     if not isinstance(merge_expr, exp.Merge):
         return [merge_expr]
 
+    _qualify_insert_values(merge_expr)
+
     return [_create_merge_candidates(merge_expr), *_mutations(merge_expr), _counts(merge_expr)]
+
+
+def _source_id(merge_expr: exp.Merge) -> exp.Identifier:
+    """The identifier that names the merge source, which is its alias when it has one."""
+    source = merge_expr.args.get("using")
+    assert isinstance(source, Expr)
+    # a source is named by its alias when it has one, which a subquery or values list always does,
+    # eg: USING (VALUES (1, 'a')) AS s (id, name)
+    alias = source.args.get("alias")
+    source_id = alias.this if alias else source.this
+    assert isinstance(source_id, exp.Identifier)
+    return source_id
+
+
+def _qualify_insert_values(merge_expr: exp.Merge) -> None:
+    """
+    Qualify unqualified columns in the VALUES of WHEN NOT MATCHED ... INSERT with the source, which is what
+    snowflake resolves them to. Otherwise they are ambiguous in the join of the target and source.
+    """
+    source_id = _source_id(merge_expr)
+
+    for w in merge_expr.args["whens"]:
+        then = w.args.get("then")
+        if w.args.get("matched") or not isinstance(then, exp.Insert):
+            continue
+        values = then.expression
+        for col in values.find_all(exp.Column):
+            if not col.args.get("table") and not _in_subquery(col, values):
+                col.set("table", source_id.copy())
+
+
+def _in_subquery(node: Expr, stop: Expr) -> bool:
+    """Whether node is inside a query nested within stop, whose columns resolve in that query's own scope."""
+    parent = node.parent
+    while parent is not None and parent is not stop:
+        if isinstance(parent, exp.Query):
+            return True
+        parent = parent.parent
+    return False
 
 
 def _create_merge_candidates(merge_expr: exp.Merge) -> Expr:
@@ -22,14 +63,7 @@ def _create_merge_candidates(merge_expr: exp.Merge) -> Expr:
 
     source = merge_expr.args.get("using")
     assert isinstance(source, Expr)
-    # a source is either a table, or a subquery or values list that carries its name in an alias,
-    # eg: USING (VALUES (1, 'a')) AS s (id, name)
-    source_id = (
-        (alias := source.args.get("alias")) and alias.this
-        if isinstance(source, (exp.Subquery, exp.Values))
-        else source.this
-    )
-    assert isinstance(source_id, exp.Identifier)
+    source_id = _source_id(merge_expr)
 
     join_expr = merge_expr.args.get("on")
     assert isinstance(join_expr, Expr)
@@ -101,7 +135,10 @@ def _create_merge_candidates(merge_expr: exp.Merge) -> Expr:
     WHERE MERGE_OP IS NOT NULL
     """
 
-    return sqlglot.parse_one(sql)
+    create = sqlglot.parse_one(sql)
+    # fakesnow's scratch table, not a Snowflake temporary object, so it isn't placed in or tracked by a schema
+    create.args["internal_temporary"] = True
+    return create
 
 
 def _mutations(merge_expr: exp.Merge) -> list[Expr]:

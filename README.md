@@ -100,6 +100,12 @@ fakesnow -s
 
 By default the server listens on a random available port. Use `-p` to specify a port.
 
+By default databases are in-memory. Use `--db_path` to persist them in an existing directory:
+
+```
+fakesnow -s --db_path databases/
+```
+
 Using docker, fakesnow server is configured to run on port 64616:
 
 ```shell
@@ -133,7 +139,15 @@ with fakesnow.server(port=12345) as conn_kwargs:
     ...
 ```
 
-By default, the server uses a single in-memory database for its lifetime. To configure database persistence or isolation:
+By default, the server uses a single in-memory database for its lifetime. To persist databases in an existing directory:
+
+```python
+# Databases will be saved to the "databases/" directory
+with fakesnow.server(db_path="databases/"):
+    ...
+```
+
+A connection can choose its own database path with the `FAKESNOW_DB_PATH` session parameter, which overrides `db_path`. Connections with the same path share databases:
 
 ```python
 # Databases will be saved to the "databases/" directory
@@ -218,6 +232,40 @@ static final GenericContainer<?> fakesnow =
 
 String url = "jdbc:snowflake://" + fakesnow.getHost() + ":" + fakesnow.getMappedPort(64616)
     + "/?ssl=off&account=fakesnow&db=db1&schema=schema1";
+```
+
+#### Connecting from dbt
+
+Point a [dbt-snowflake](https://docs.getdbt.com/docs/core/connect-data-platform/snowflake-setup) profile at `fakesnow -s`:
+
+```yaml
+my_project:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: fakesnow
+      user: fake
+      password: snow
+      database: dbt_db
+      schema: analytics
+      host: localhost
+      port: <port number from server startup>
+      protocol: http
+      threads: 4
+```
+
+Running models in parallel with `threads` greater than 1 is supported, both against the server and in-process.
+
+Or run dbt in-process with [`dbtRunner`](https://docs.getdbt.com/reference/programmatic-invocations) inside `fakesnow.patch()`, in which case `host`, `port` and `protocol` aren't needed:
+
+```python
+import fakesnow
+from dbt.cli.main import dbtRunner
+
+with fakesnow.patch():
+    result = dbtRunner().invoke(["build"])
+    assert result.success
 ```
 
 ### pytest fixtures

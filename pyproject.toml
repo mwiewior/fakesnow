@@ -35,6 +35,7 @@ dev = [
     "pyarrow-stubs==20.0.0.20260819",
     "pyright==1.1.414",
     "pytest~=9.1",
+    "pytest-timeout~=2.4",
     "ruff~=0.16.9",
     # include compatible version of pandas, and secure-local-storage for token caching
     "snowflake-connector-python[pandas, secure-local-storage]",
@@ -45,6 +46,8 @@ dev = [
     "testcontainers>=4.15.0",
     "twine~=7.0",
 ]
+# for the end-to-end dbt project test
+dbt = ["dbt-core~=1.12", "dbt-snowflake~=1.12"]
 # for debugging, see https://duckdb.org/docs/guides/python/jupyter.html
 notebook = ["duckdb-engine", "ipykernel", "jupysql"]
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Iterable
 from pathlib import Path
 from types import TracebackType
@@ -15,6 +16,9 @@ import fakesnow.info_schema as info_schema
 import fakesnow.macros as macros
 from fakesnow.cursor import FakeSnowflakeCursor
 from fakesnow.dialect import parse
+from fakesnow.expr import normalise_ident
+from fakesnow.owners import Owners
+from fakesnow.temporary import TemporaryObjects
 from fakesnow.transforms.stage import TableStages
 from fakesnow.variables import Variables
 
@@ -30,6 +34,7 @@ class FakeSnowflakeConnection:
         create_schema: bool = True,
         db_path: str | os.PathLike | None = None,
         nop_regexes: list[str] | None = None,
+        owners: Owners | None = None,
         *args: Any,
         **kwargs: Any,
     ):
@@ -46,15 +51,24 @@ class FakeSnowflakeConnection:
             "_FS_INFORMATION_SCHEMA" if schema.upper() == "INFORMATION_SCHEMA" else schema.upper()
         )
 
+        # roles and warehouses have no duckdb equivalent, so they are only tracked for current_role() etc
+        self.role: str = normalise_ident(kwargs.get("role") or "PUBLIC")
+        self.warehouse: str | None = (w := kwargs.get("warehouse")) and normalise_ident(w)
+        # as the connector's, eg: for SYSTEM$CANCEL_ALL_QUERIES(<session id>)
+        self.session_id: int = secrets.randbelow(10**10)
+
         self.database_set = False
         self.schema_set = False
         self.db_path = Path(db_path) if db_path else None
         self.nop_regexes = nop_regexes
         self._paramstyle = kwargs.get("paramstyle", snowflake.connector.paramstyle)
         self.variables = Variables()
-        self.table_stages = TableStages(duck_conn)
+        self.temporaries = TemporaryObjects(duck_conn)
+        self.owners = owners or Owners()
+        self.table_stages = TableStages(duck_conn, self.temporaries)
         self.results_cache = results_cache
         self._autocommit = kwargs.get("autocommit", True)
+        self.query_tag: str = (kwargs.get("session_parameters") or {}).get("QUERY_TAG") or ""
         self._in_transaction = False
 
         # create database if needed
@@ -79,6 +93,7 @@ class FakeSnowflakeConnection:
             duck_conn.execute(f"ATTACH DATABASE '{db_file}' AS {self.database}")
             duck_conn.execute(info_schema.per_db_creation_sql(self.database))
             duck_conn.execute(macros.creation_sql(self.database))
+            self.owners.record(duck_conn, "DATABASE", [self.database], self.role)
 
         # create schema if needed
         if (
@@ -91,6 +106,7 @@ class FakeSnowflakeConnection:
             ).fetchone()
         ):
             duck_conn.execute(f"CREATE SCHEMA {self.database}.{self._schema}")
+            self.owners.record(duck_conn, "SCHEMA", [self.database, self._schema], self.role)
 
         # set database and schema if both exist
         if (

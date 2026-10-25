@@ -5,7 +5,9 @@ import json
 import logging
 import os
 import secrets
+import threading
 from base64 import b64encode
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -35,8 +37,73 @@ logger = logging.getLogger("fakesnow.server")
 logger.handlers = logging.getLogger("uvicorn").handlers
 logger.setLevel(logging.INFO)
 
-shared_fs = FakeSnow()
+# server-wide default for logins that don't send FAKESNOW_DB_PATH. None is a shared in-memory database.
+default_db_path: str | None = None
+# instances keyed by realpath of their db_path. each server has its own event loop thread, so a lock guards them.
+_instances: dict[str, FakeSnow] = {}
+_instances_lock = threading.Lock()
+# number of running servers defaulting to each instance key, so the instance outlives all but the last
+_server_counts: dict[str, int] = {}
+# the db_path of each running server, oldest first. the newest is the default, so stopping servers in any order
+# leaves the default of one still running
+_running_defaults: list[tuple[object, str | None]] = []
 sessions: dict[str, FakeSnowflakeConnection] = {}
+
+
+def _instance_key(db_path: str | None) -> str:
+    return os.path.realpath(db_path) if db_path else ""
+
+
+def instance_for(db_path: str | None) -> FakeSnow:
+    """Get the instance for a db_path, creating it on first use, so logins with the same path share it.
+
+    None is the default shared in-memory instance. ":isolated:" is always a new in-memory instance.
+    """
+    if db_path == ":isolated:":
+        return FakeSnow()
+    key = _instance_key(db_path)
+    with _instances_lock:
+        if key not in _instances:
+            _instances[key] = FakeSnow(db_path=key) if db_path else FakeSnow()
+        return _instances[key]
+
+
+def set_default_db_path(db_path: str | None) -> Callable[[], None]:
+    """Set the default db_path for a starting server and return a function to call when it stops.
+
+    Stopping restores the default of the newest server still running, or None, and closes the instance for db_path
+    once no other server in the process defaults to it, so other servers keep their instances and sessions.
+    """
+    global default_db_path
+    token = object()
+    key = _instance_key(db_path)
+    with _instances_lock:
+        _running_defaults.append((token, db_path))
+        default_db_path = db_path
+        if db_path:
+            _server_counts[key] = _server_counts.get(key, 0) + 1
+
+    def restore() -> None:
+        global default_db_path
+        with _instances_lock:
+            _running_defaults[:] = [(t, p) for t, p in _running_defaults if t is not token]
+            default_db_path = _running_defaults[-1][1] if _running_defaults else None
+        if not db_path:
+            return
+        with _instances_lock:
+            _server_counts[key] -= 1
+            if _server_counts[key]:
+                return
+            del _server_counts[key]
+            fs = _instances.pop(key, None)
+        if fs:
+            # closes sessions still open on the instance, so their connections don't keep its database files attached
+            fs.close()
+            for session_token, conn in list(sessions.items()):
+                if conn.is_closed():
+                    sessions.pop(session_token, None)
+
+    return restore
 
 
 @dataclass
@@ -49,6 +116,8 @@ class ServerError(Exception):
 async def login_request(request: Request) -> JSONResponse:
     database = (d := request.query_params.get("databaseName")) and normalise_ident(d)
     schema = (s := request.query_params.get("schemaName")) and normalise_ident(s)
+    role = request.query_params.get("roleName")
+    warehouse = request.query_params.get("warehouse")
     body = await request.body()
     if request.headers.get("Content-Encoding") == "gzip":
         body = gzip.decompress(body)
@@ -57,16 +126,22 @@ async def login_request(request: Request) -> JSONResponse:
     nop_regexes = session_params.get("nop_regexes")
     autocommit = session_params.get("AUTOCOMMIT", True)
 
-    if db_path := session_params.get("FAKESNOW_DB_PATH"):
-        # isolated creates a new in-memory database, rather than using the shared in-memory database
-        # so this connection won't share any tables with other connections
-        fs = FakeSnow() if db_path == ":isolated:" else FakeSnow(db_path=db_path)
-    else:
-        # share the in-memory database across connections
-        fs = shared_fs
+    fs = instance_for(session_params.get("FAKESNOW_DB_PATH") or default_db_path)
     token = secrets.token_urlsafe(32)
     logger.info(f"Session login {database=} {schema=} {nop_regexes=}")
-    sessions[token] = fs.connect(database, schema, nop_regexes=nop_regexes, autocommit=autocommit)
+    try:
+        sessions[token] = fs.connect(
+            database,
+            schema,
+            nop_regexes=nop_regexes,
+            autocommit=autocommit,
+            session_parameters=session_params,
+            role=role,
+            warehouse=warehouse,
+        )
+    except NotADirectoryError as e:
+        # fail the login, rather than return a server error the client retries until it times out
+        return JSONResponse({"data": None, "message": str(e), "success": False})
     return JSONResponse(
         {
             "data": {

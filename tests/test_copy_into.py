@@ -925,6 +925,36 @@ def test_copy_parquet_match_by_column_name(dcur: snowflake.connector.cursor.Dict
     assert dcur.fetchall() == [{"A": 1, "B": 10}, {"A": 2, "B": 20}]
 
 
+def test_copy_parquet_match_by_column_name_into_qualified_temporary_table(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    dcur.execute("CREATE TABLE schema1.table1 (a INT)")
+    dcur.execute("CREATE TEMPORARY TABLE db1.schema1.table1 (a INT, b INT)")
+    parquet_data = pd.DataFrame({"a": [1], "b": [10]}).to_parquet()
+    bucket = upload_file(s3_client, parquet_data, key="data.parquet")
+    dcur.execute(
+        f"COPY INTO db1.schema1.table1 FROM 's3://{bucket}/' FILES=('data.parquet') "
+        "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE FILE_FORMAT = (TYPE = 'PARQUET')"
+    )
+    dcur.execute("SELECT a, b FROM db1.schema1.table1")
+    assert dcur.fetchall() == [{"A": 1, "B": 10}]
+
+
+def test_copy_parquet_match_by_column_name_into_unqualified_temporary_table(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    dcur.execute("CREATE TABLE schema1.table1 (a INT)")
+    dcur.execute("CREATE TEMPORARY TABLE table1 (a INT, b INT)")
+    parquet_data = pd.DataFrame({"a": [1], "b": [10]}).to_parquet()
+    bucket = upload_file(s3_client, parquet_data, key="data.parquet")
+    dcur.execute(
+        f"COPY INTO table1 FROM 's3://{bucket}/' FILES=('data.parquet') "
+        "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE FILE_FORMAT = (TYPE = 'PARQUET')"
+    )
+    dcur.execute("SELECT a, b FROM table1")
+    assert dcur.fetchall() == [{"A": 1, "B": 10}]
+
+
 def test_copy_parquet_schema_uses_literal_stage_path(dcur: snowflake.connector.cursor.DictCursor) -> None:
     dcur.execute("CREATE TABLE literal_parquet_target (a INT)")
     dcur.execute("CREATE STAGE literal_parquet_stage")
@@ -1318,6 +1348,119 @@ def test_load_history_is_per_table(dcur: snowflake.connector.cursor.DictCursor, 
     # recreating the table resets its load history
     dcur.execute("CREATE OR REPLACE TABLE schema1.table1 (a INT, b INT)")
     dcur.execute(sql.format(table="table1", bucket=bucket))
+    assert dcur.fetchall()[0]["status"] == "LOADED"
+
+
+def test_load_history_kept_when_temporary_table_created_in_other_schema(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    create_table(dcur)
+    bucket = str(uuid.uuid4())
+    upload_file(s3_client, "1,2", bucket=bucket, key="foo.csv")
+    sql = f"COPY INTO table1 FROM 's3://{bucket}/' FILES=('foo.csv')"
+    dcur.execute(sql)
+
+    dcur.execute("CREATE SCHEMA db1.other")
+    dcur.execute("USE SCHEMA schema1")
+    dcur.execute("CREATE TEMPORARY TABLE db1.other.table1 (a INT, b INT)")
+
+    # schema1.table1 is not the table that was created, so it still skips the loaded file
+    dcur.execute(sql)
+    assert dcur.fetchall()[0]["status"] == "LOAD_SKIPPED"
+
+
+def test_load_history_follows_swapped_tables(dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client) -> None:
+    create_table(dcur)
+    dcur.execute("CREATE TABLE schema1.table2 (a INT, b INT)")
+    bucket = str(uuid.uuid4())
+    upload_file(s3_client, "1,2", bucket=bucket, key="foo.csv")
+    sql = "COPY INTO {table} FROM 's3://{bucket}/' FILES=('foo.csv')"
+    dcur.execute(sql.format(table="table1", bucket=bucket))
+
+    dcur.execute("ALTER TABLE table1 SWAP WITH table2")
+
+    # the table that loaded the file is now table2, so table1 loads it
+    dcur.execute(sql.format(table="table1", bucket=bucket))
+    assert dcur.fetchall()[0]["status"] == "LOADED"
+
+
+def test_copy_into_qualified_temporary_table_loads_it(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    create_table(dcur)
+    dcur.execute("CREATE TEMPORARY TABLE db1.schema1.table1 (a INT, b INT)")
+    bucket = str(uuid.uuid4())
+    upload_file(s3_client, "1,2", bucket=bucket, key="foo.csv")
+    dcur.execute(f"COPY INTO db1.schema1.table1 FROM 's3://{bucket}/' FILES=('foo.csv')")
+    dcur.execute("SELECT a, b FROM db1.schema1.table1")
+    assert dcur.fetchall() == [{"A": 1, "B": 2}]
+
+
+def test_copy_into_qualified_temporary_table_leaves_shadowed_table(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    create_table(dcur)
+    dcur.execute("CREATE TEMPORARY TABLE db1.schema1.table1 (a INT, b INT)")
+    bucket = str(uuid.uuid4())
+    upload_file(s3_client, "1,2", bucket=bucket, key="foo.csv")
+    dcur.execute(f"COPY INTO db1.schema1.table1 FROM 's3://{bucket}/' FILES=('foo.csv')")
+    # drops the temporary table, which shadows the permanent one
+    dcur.execute("DROP TABLE db1.schema1.table1")
+    dcur.execute("SELECT count(*) AS n FROM db1.schema1.table1")
+    assert dcur.fetchall() == [{"N": 0}]
+
+
+def test_copy_into_temporary_table_ignores_shadowed_table_history(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    create_table(dcur)
+    bucket = str(uuid.uuid4())
+    upload_file(s3_client, "1,2", bucket=bucket, key="foo.csv")
+    sql = f"COPY INTO db1.schema1.table1 FROM 's3://{bucket}/' FILES=('foo.csv')"
+    dcur.execute(sql)
+    dcur.execute("CREATE TEMPORARY TABLE db1.schema1.table1 (a INT, b INT)")
+    dcur.execute(sql)
+    assert dcur.fetchall()[0]["status"] == "LOADED"
+
+
+def test_copy_into_temporary_table_leaves_shadowed_table_history(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    create_table(dcur)
+    bucket = str(uuid.uuid4())
+    upload_file(s3_client, "1,2", bucket=bucket, key="foo.csv")
+    sql = f"COPY INTO db1.schema1.table1 FROM 's3://{bucket}/' FILES=('foo.csv')"
+    dcur.execute("CREATE TEMPORARY TABLE db1.schema1.table1 (a INT, b INT)")
+    dcur.execute(sql)
+    # drops the temporary table, which shadows the permanent one
+    dcur.execute("DROP TABLE db1.schema1.table1")
+    dcur.execute(sql)
+    assert dcur.fetchall()[0]["status"] == "LOADED"
+
+
+def test_copy_into_temporary_table_skips_file_it_loaded(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    dcur.execute("CREATE TEMPORARY TABLE table1 (a INT, b INT)")
+    bucket = str(uuid.uuid4())
+    upload_file(s3_client, "1,2", bucket=bucket, key="foo.csv")
+    sql = f"COPY INTO table1 FROM 's3://{bucket}/' FILES=('foo.csv')"
+    dcur.execute(sql)
+    dcur.execute(sql)
+    assert dcur.fetchall()[0]["status"] == "LOAD_SKIPPED"
+
+
+def test_copy_into_temporary_table_reloads_rolled_back_file(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    dcur.execute("CREATE TEMPORARY TABLE table1 (a INT, b INT)")
+    bucket = str(uuid.uuid4())
+    upload_file(s3_client, "1,2", bucket=bucket, key="foo.csv")
+    sql = f"COPY INTO table1 FROM 's3://{bucket}/' FILES=('foo.csv')"
+    dcur.execute("BEGIN")
+    dcur.execute(sql)
+    dcur.execute("ROLLBACK")
+    dcur.execute(sql)
     assert dcur.fetchall()[0]["status"] == "LOADED"
 
 

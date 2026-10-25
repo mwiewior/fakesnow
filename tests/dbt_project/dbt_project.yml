@@ -1,0 +1,6 @@
+name: fsproj
+version: "1.0"
+profile: fsproj
+flags:
+  send_anonymous_usage_stats: false
+  version_check: false

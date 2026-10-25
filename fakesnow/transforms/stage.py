@@ -20,6 +20,7 @@ from sqlglot import Expr, exp
 
 from fakesnow.expr import normalise_ident
 from fakesnow.params import MutableParams
+from fakesnow.temporary import TemporaryObjects
 from fakesnow.transforms.options import parse_options
 
 # TODO: clean up temp files on exit
@@ -45,35 +46,14 @@ class UploadCommandDict(TypedDict):
 class TableStages:
     """Resolve implicit table stages, including session-local temporary tables.
 
-    DuckDB keeps temporary tables in one session namespace, so remember the Snowflake schema each was created in.
-    Table OIDs survive renames and are never reused. Lookups embed only the live table's OID, and registrations
-    for dropped tables are pruned when another temporary table is created, so session history stays bounded.
+    Temporary table stages are keyed by the table's OID, which survives renames and is never reused. Lookups
+    embed only the live table's OID, and only if the table was created in the requested schema.
     """
 
-    def __init__(self, duck_conn: DuckDBPyConnection):
+    def __init__(self, duck_conn: DuckDBPyConnection, temporaries: TemporaryObjects):
         self._duck_conn = duck_conn
         self._session = uuid.uuid4().hex
-        # Temporary table OID -> (catalog, schema) it was created in, which DuckDB does not record.
-        self._temporary: dict[int, tuple[str | None, str | None]] = {}
-
-    def record_temporary_table(self, expression: Expr, catalog: str | None, schema: str | None) -> None:
-        if not (
-            isinstance(expression, exp.Create)
-            and expression.args.get("kind") == "TABLE"
-            and expression.find(exp.TemporaryProperty)
-            and (table := expression.find(exp.Table))
-        ):
-            return
-        # Temporary table names are unique within the session, so the name identifies the new table's OID.
-        sql = "SELECT table_name, table_oid FROM duckdb_tables() WHERE temporary"
-        live = dict(self._duck_conn.execute(sql).fetchall())
-        # Forget dropped tables here rather than tracking DROP, so the registry is bounded by live tables.
-        live_oids = set(live.values())
-        self._temporary = {oid: owner for oid, owner in self._temporary.items() if oid in live_oids}
-        # CREATE TEMP TABLE IF NOT EXISTS succeeds without creating anything when the name is already taken, even
-        # from another schema, so the OID may already be registered. Keep the schema it was created in; overwriting
-        # it would move the existing table's stage to the current schema.
-        self._temporary.setdefault(live[table.name], (table.catalog or catalog, table.db or schema))
+        self._temporaries = temporaries
 
     def resolve_for_copy(
         self, catalog: str, schema: str, stage_name: str, target: tuple[str | None, str | None, str]
@@ -103,7 +83,7 @@ class TableStages:
         # requested schema; otherwise match nothing (NULL), leaving any permanent table to resolve.
         sql = "SELECT table_oid FROM duckdb_tables() WHERE temporary AND table_name = ?"
         live = self._duck_conn.execute(sql, [stage_name[1:]]).fetchone()
-        oid = live[0] if live and self._temporary.get(live[0]) == (catalog, schema) else "NULL"
+        oid = live[0] if live and self._temporaries.owner(stage_name[1:]) == (catalog, schema) else "NULL"
         # Temporary storage is keyed by session and OID, so it is isolated between sessions and follows renames.
         logical_name = exp.Literal.string(f"{catalog}.{schema}.{stage_name}").sql(dialect="duckdb")
         return f"""

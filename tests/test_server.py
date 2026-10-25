@@ -1,10 +1,14 @@
 # ruff: noqa: E501
 
 import datetime
+import importlib
 import os
 import tempfile
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -18,6 +22,9 @@ from dirty_equals import IsDatetime, IsInt, IsStr, IsUUID
 from pandas.testing import assert_frame_equal
 from snowflake.connector.cursor import ResultMetadata
 
+import fakesnow
+from fakesnow.fakes import FakeSnowflakeConnection
+from fakesnow.instance import FakeSnow
 from tests.utils import indent
 
 
@@ -390,6 +397,14 @@ def test_server_session_heartbeat_invalid_authorization(server: dict) -> None:
     assert response.json()["success"] is False
     assert response.json()["code"] == "390104"
     assert response.json()["message"] == "User must login again to access the service."
+
+
+def test_server_query_tag_session_parameter(server: dict) -> None:
+    params = server["session_parameters"] | {"QUERY_TAG": "dbt"}
+    with snowflake.connector.connect(**server | {"session_parameters": params}) as conn:
+        cur = conn.cursor(snowflake.connector.cursor.DictCursor)
+        cur.execute("SHOW PARAMETERS LIKE 'QUERY_TAG'")
+        assert cur.fetchall()[0]["value"] == "dbt"
 
 
 def test_server_nop_regexes(server: dict) -> None:
@@ -813,3 +828,168 @@ def test_server_describe_only(server: dict) -> None:
         # nothing ran: the original table is untouched
         cur.execute("select * from example")
         assert cur.fetchall() == [(1, "old")]
+
+
+def test_db_path_sessions_share_instance(server: dict, tmp_path: Path) -> None:
+    params = server["session_parameters"] | {"FAKESNOW_DB_PATH": str(tmp_path)}
+    with (
+        snowflake.connector.connect(**(server | {"session_parameters": params}), database="db1", schema="s1") as c1,
+        snowflake.connector.connect(**(server | {"session_parameters": params}), database="db1", schema="s1") as c2,
+    ):
+        c1.cursor().execute("create table t (id int)")
+        c1.cursor().execute("insert into t values (1)")
+        cur = c2.cursor()
+        cur.execute("select id from t")
+        assert cur.fetchall() == [(1,)]
+
+
+def test_db_path_session_with_missing_directory_fails_login(server: dict, tmp_path: Path) -> None:
+    params = server["session_parameters"] | {"FAKESNOW_DB_PATH": str(tmp_path / "missing")}
+    with pytest.raises(snowflake.connector.errors.DatabaseError, match="No such directory"):
+        snowflake.connector.connect(**(server | {"session_parameters": params}), database="db1", login_timeout=10)
+
+
+def test_db_path_sessions_share_instance_across_path_spellings(server: dict, tmp_path: Path) -> None:
+    # same directory, spelled with a trailing slash and a "." segment
+    p1 = server["session_parameters"] | {"FAKESNOW_DB_PATH": str(tmp_path)}
+    p2 = server["session_parameters"] | {"FAKESNOW_DB_PATH": f"{tmp_path}/./"}
+    with (
+        snowflake.connector.connect(**(server | {"session_parameters": p1}), database="db1", schema="s1") as c1,
+        snowflake.connector.connect(**(server | {"session_parameters": p2}), database="db1", schema="s1") as c2,
+    ):
+        c1.cursor().execute("create table t (id int)")
+        cur = c2.cursor()
+        cur.execute("select count(*) from t")
+        assert cur.fetchall() == [(0,)]
+
+
+def test_isolated_sessions_do_not_share(server: dict) -> None:
+    params = server["session_parameters"] | {"FAKESNOW_DB_PATH": ":isolated:"}
+    with (
+        snowflake.connector.connect(**(server | {"session_parameters": params}), database="db1", schema="s1") as c1,
+        snowflake.connector.connect(**(server | {"session_parameters": params}), database="db1", schema="s1") as c2,
+    ):
+        c1.cursor().execute("create table t (id int)")
+        with pytest.raises(snowflake.connector.errors.ProgrammingError, match="does not exist"):
+            c2.cursor().execute("select * from t")
+
+
+def test_server_default_db_path_persists(tmp_path: Path) -> None:
+    for _ in range(2):
+        with (
+            fakesnow.server(db_path=str(tmp_path)) as kwargs,
+            snowflake.connector.connect(**kwargs, database="db1", schema="s1") as conn,
+        ):
+            conn.cursor().execute("create table if not exists t (id int)")
+            conn.cursor().execute("insert into t values (1)")
+    with (
+        fakesnow.server(db_path=str(tmp_path)) as kwargs,
+        snowflake.connector.connect(**kwargs, database="db1", schema="s1") as conn,
+    ):
+        cur = conn.cursor()
+        cur.execute("select count(*) from t")
+        assert cur.fetchall() == [(2,)]
+
+
+@pytest.mark.timeout(60)
+def test_server_stopping_one_of_two_servers_on_a_db_path_keeps_the_other_serving(tmp_path: Path) -> None:
+    with (
+        fakesnow.server(db_path=str(tmp_path)) as kwargs,
+        snowflake.connector.connect(**kwargs, database="db1", schema="s1") as conn,
+    ):
+        with fakesnow.server(db_path=str(tmp_path)):
+            pass
+        cur = conn.cursor()
+        cur.execute("select 1")
+        assert cur.fetchall() == [(1,)]
+
+
+def _stop_server_with_session_open(db_path: Path) -> tuple[str, FakeSnowflakeConnection]:
+    """Stop a server on db_path while a client's session is open, and return the session's token and connection."""
+    with fakesnow.server(db_path=str(db_path)) as kwargs:
+        # imported once the server is running, since importing it rebinds fakesnow.server to the module
+        server_module = importlib.import_module("fakesnow.server")
+        before = set(server_module.sessions)
+        # the client stays connected, so its session is still open as the server stops
+        client = snowflake.connector.connect(**kwargs, database="db1", schema="s1")
+        [(token, conn)] = [(t, c) for t, c in server_module.sessions.items() if t not in before]
+    del client
+    return token, conn
+
+
+def test_server_stopping_on_db_path_closes_open_sessions(tmp_path: Path) -> None:
+    # the session's duckdb connection would otherwise keep the database files attached to a closed instance
+    _, conn = _stop_server_with_session_open(tmp_path)
+    assert conn.is_closed()
+
+
+def test_server_stopping_on_db_path_forgets_open_sessions(tmp_path: Path) -> None:
+    token, _ = _stop_server_with_session_open(tmp_path)
+    assert token not in importlib.import_module("fakesnow.server").sessions
+
+
+def test_db_path_instance_is_shared_by_concurrent_first_logins(tmp_path: Path) -> None:
+    server_module = importlib.import_module("fakesnow.server")
+    real = server_module.FakeSnow
+
+    def slow_fake_snow(**kwargs: Any) -> FakeSnow:
+        # widen the window between checking the cache and filling it
+        time.sleep(0.2)
+        return real(**kwargs)
+
+    path = str(tmp_path / "concurrent")
+    os.mkdir(path)
+    with patch.object(server_module, "FakeSnow", slow_fake_snow), ThreadPoolExecutor(2) as pool:
+        first, second = pool.map(lambda _: server_module.instance_for(path), range(2))
+    restore = server_module.set_default_db_path(path)
+    restore()
+    assert first is second
+
+
+def test_server_default_db_path_kept_until_last_same_path_server_stops(tmp_path: Path) -> None:
+    first = fakesnow.server(db_path=str(tmp_path))
+    second = fakesnow.server(db_path=str(tmp_path))
+    first.__enter__()
+    kwargs = second.__enter__()
+    try:
+        # stop the first-started server while the second keeps running
+        first.__exit__(None, None, None)
+        with snowflake.connector.connect(**kwargs, database="db1", schema="s1"):
+            pass
+        assert (tmp_path / "DB1.db").exists()
+    finally:
+        second.__exit__(None, None, None)
+
+
+def test_server_missing_db_path_raises(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    with pytest.raises(NotADirectoryError, match="No such directory"), fakesnow.server(db_path=str(missing)):
+        pass
+
+
+def test_server_failed_start_restores_default_db_path(tmp_path: Path) -> None:
+    server_module = importlib.import_module("fakesnow.server")
+
+    with (
+        patch("uvicorn.Server.run"),
+        pytest.raises(RuntimeError, match="Failed to start server"),
+        fakesnow.server(db_path=str(tmp_path)),
+    ):
+        pass
+
+    assert server_module.default_db_path is None
+
+
+def test_server_current_role_from_login(server: dict) -> None:
+    with snowflake.connector.connect(**server, role="sysadmin") as conn:
+        cur = conn.cursor()
+        cur.execute("select current_role()")
+        assert cur.fetchall() == [("SYSADMIN",)]
+
+
+def test_server_current_warehouse_from_login(server: dict) -> None:
+    # assumes the warehouse exists, as test_current_warehouse_from_connect
+    with snowflake.connector.connect(**server, warehouse="wh") as conn:
+        cur = conn.cursor()
+        cur.execute("select current_warehouse()")
+        assert cur.fetchall() == [("WH",)]

@@ -10,6 +10,7 @@ import sqlglot
 from duckdb import DuckDBPyConnection
 from sqlglot import Expr, exp
 
+from fakesnow.expr import normalise_ident
 from fakesnow.params import MutableParams, pop_qmark_param
 from fakesnow.variables import Variables
 
@@ -157,23 +158,18 @@ def array_agg_within_group(expression: Expr) -> Expr:
 
 
 def create_clone(expression: Expr) -> Expr:
-    """Transform create table clone to create table as select."""
+    """Transform create table clone to create table as select.
+
+    The rest of the CREATE is kept, eg: OR REPLACE, TEMPORARY, and where temporary_objects placed it.
+    """
 
     if (
         isinstance(expression, exp.Create)
         and str(expression.args.get("kind")).upper() == "TABLE"
         and (clone := expression.find(exp.Clone))
     ):
-        return exp.Create(
-            this=expression.this,
-            kind="TABLE",
-            expression=exp.Select(
-                expressions=[
-                    exp.Star(),
-                ],
-                from_=exp.From(this=clone.this),
-            ),
-        )
+        expression.set("clone", None)
+        expression.set("expression", exp.Select(expressions=[exp.Star()], from_=exp.From(this=clone.this)))
     return expression
 
 
@@ -185,6 +181,47 @@ def current_version(expression: Expr) -> Expr:
 
     if isinstance(expression, exp.CurrentVersion):
         return exp.Literal(this=SERVER_VERSION, is_string=True)
+
+    return expression
+
+
+def session_context(expression: Expr, role: str, warehouse: str | None) -> Expr:
+    """Replace CURRENT_ROLE() and CURRENT_WAREHOUSE() with the session's values.
+
+    Example:
+        >>> import sqlglot
+        >>> sqlglot.parse_one("SELECT CURRENT_ROLE(), CURRENT_WAREHOUSE()", read="snowflake").transform(
+        ...     session_context, role="SYSADMIN", warehouse=None
+        ... ).sql()
+        "SELECT 'SYSADMIN', NULL"
+    """
+
+    if isinstance(expression, exp.CurrentRole):
+        return exp.Literal.string(role)
+
+    if isinstance(expression, exp.CurrentWarehouse):
+        return exp.Literal.string(warehouse) if warehouse else exp.Null()
+
+    return expression
+
+
+def system_cancel_all_queries(expression: Expr, session_id: int) -> Expr:
+    """Accept SYSTEM$CANCEL_ALL_QUERIES, which dbt runs on interrupt. Queries run synchronously, so none are running.
+
+    Example:
+        >>> import sqlglot
+        >>> sqlglot.parse_one("SELECT SYSTEM$CANCEL_ALL_QUERIES(1234)", read="snowflake").transform(
+        ...     lambda e: system_cancel_all_queries(e, 1234)
+        ... ).sql()
+        "SELECT '0 cancelled.'"
+    """
+
+    if isinstance(expression, exp.Anonymous) and str(expression.this).upper() == "SYSTEM$CANCEL_ALL_QUERIES":
+        arg = expression.expressions[0] if expression.expressions else None
+        if not (isinstance(arg, exp.Literal) and not arg.is_string):
+            return exp.Literal.string("invalid argument")
+        # only the session's own queries can be cancelled, and none are running
+        return exp.Literal.string("0 cancelled." if arg.this == str(session_id) else "invalid session id")
 
     return expression
 
@@ -242,7 +279,7 @@ SELECT
     NULL::VARCHAR AS "comment",
     NULL::VARCHAR AS "policy name",
     NULL::JSON AS "privacy domain",
-FROM _fs_information_schema._fs_columns
+FROM _fs_global._fs_information_schema._fs_columns
 WHERE table_catalog = '${catalog}' AND table_schema = '${schema}' AND table_name = '${table}'
 ORDER BY ordinal_position
 """
@@ -479,7 +516,10 @@ def extract_comment_on_table(expression: Expr) -> Expr:
             new = expression.copy()
             new_props: exp.Properties = new.args["properties"]
             new_props.set("expressions", other_props)
-            new.args["table_comment"] = (table, comment)
+            # only record a comment that is present, eg: not for the TEMPORARY or TRANSIENT property alone,
+            # because recording writes to the global database, which a transaction can't do after other writes
+            if comment is not None:
+                new.args["table_comment"] = (table, comment)
             return new
     elif (
         isinstance(expression, exp.Comment)
@@ -604,6 +644,52 @@ def hex_string(expression: Expr) -> Expr:
     if isinstance(expression, exp.HexString):
         return exp.Anonymous(this="from_hex", expressions=[exp.Literal.string(expression.this)])
     return expression
+
+
+_ON_ALL = re.compile(r"\bON\s+ALL\s+(\w+)\s+IN\s+(SCHEMA|DATABASE)\s+(.+?)\s+(?:TO|FROM)\s", re.IGNORECASE)
+_ALL_KINDS = {"TABLES": "BASE TABLE", "VIEWS": "VIEW"}
+
+
+def grant_revoke(
+    expression: Expr, duck_conn: DuckDBPyConnection, current_database: str | None, current_schema: str | None
+) -> Expr:
+    """Accept GRANT and REVOKE as no-ops, since privileges aren't enforced.
+
+    As Snowflake does, GRANT ... ON ALL reports the objects it covers, and REVOKE the grants it removes, which is
+    none as grants aren't recorded.
+
+    See https://docs.snowflake.com/en/sql-reference/sql/grant-privilege
+    """
+    # sqlglot parses forms it doesn't support (eg: ALL/FUTURE, role grants, shares) as a Command
+    if not (
+        isinstance(expression, (exp.Grant, exp.Revoke))
+        or (
+            isinstance(expression, exp.Command)
+            and isinstance(expression.this, str)
+            and expression.this.upper() in ("GRANT", "REVOKE")
+        )
+    ):
+        return expression
+
+    text = expression.sql(dialect="snowflake")
+    revoke = isinstance(expression, exp.Revoke) or text.upper().startswith("REVOKE")
+    on_all = _ON_ALL.search(text)
+    if not (revoke and " FUTURE " not in text.upper()) and not on_all:
+        return SUCCESS_NOP.copy()
+    count = 0
+    if on_all and not revoke and (table_type := _ALL_KINDS.get(on_all.group(1).upper())):
+        parts = [normalise_ident(p.sql(dialect="snowflake")) for p in exp.to_table(on_all.group(3)).parts]
+        if on_all.group(2).upper() == "SCHEMA":
+            database, schema = (parts[0], parts[1]) if len(parts) > 1 else (current_database, parts[0])
+        else:
+            database, schema = parts[0], None
+        (count,) = duck_conn.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_catalog = ? AND table_type = ? "
+            "AND table_schema NOT IN ('information_schema', '_fs_information_schema') "
+            "AND (? IS NULL OR table_schema = ?)",
+            [database, table_type, schema, schema],
+        ).fetchone()  # type: ignore[misc]
+    return sqlglot.parse_one(f"SELECT 'Statement executed successfully. {count} objects affected.' AS status")
 
 
 def haversine(expression: Expr) -> Expr:
@@ -1081,8 +1167,17 @@ def set_schema(expression: Expr, current_database: str | None) -> Expr:
         and isinstance(kind, exp.Var)
         and kind.name
     ):
+        if kind.name.upper() in ["ROLE", "WAREHOUSE"]:
+            # duckdb has no roles or warehouses, so the session only records them
+            assert expression.this, f"No identifier for USE expression {expression}"
+            ident = expression.this.find(exp.Identifier)
+            assert ident, f"No identifier for USE expression {expression}"
+            new = SUCCESS_NOP.copy()
+            # quoted identifiers are case-sensitive
+            new.args[f"set_{kind.name.lower()}"] = ident.name if ident.quoted else ident.name.upper()
+            return new
+
         if kind.name.upper() not in ["SCHEMA", "DATABASE"]:
-            # duckdb has no roles or warehouses, so USE ROLE/WAREHOUSE is a NOP
             return SUCCESS_NOP
 
         assert expression.this, f"No identifier for USE expression {expression}"
@@ -1503,6 +1598,11 @@ def alter_session(expression: Expr) -> Expr:
         - SET ... = true       => Not implemented
     - AUTOCOMMIT:
         - SET ... = true/false => success (returns NOP success with side effect arg)
+    - QUERY_TAG:
+        - SET ... = '<tag>'    => success (returns NOP success with side effect arg)
+        - UNSET ...            => success (side effect arg is the empty tag)
+
+    Setting or unsetting several parameters in one statement is not implemented.
     """
 
     if (
@@ -1512,7 +1612,8 @@ def alter_session(expression: Expr) -> Expr:
     ):
         items = alter_session.args.get("expressions") or []
 
-        if items and isinstance(items[0], exp.SetItem) and (ident := items[0].find(exp.Identifier)):
+        # only one parameter is handled at a time, so don't silently ignore the rest
+        if len(items) == 1 and isinstance(items[0], exp.SetItem) and (ident := items[0].find(exp.Identifier)):
             name = ident.this.upper()
 
             if name == "QUOTED_IDENTIFIERS_IGNORE_CASE" and (
@@ -1534,6 +1635,19 @@ def alter_session(expression: Expr) -> Expr:
             ):
                 new = SUCCESS_NOP.copy()
                 new.args["set_autocommit"] = rhs.this
+                return new
+
+            elif name == "QUERY_TAG":
+                tag = ""
+                if not alter_session.args.get("unset"):
+                    rhs = items[0].this.args.get("expression") if isinstance(items[0].this, exp.EQ) else None
+                    if not isinstance(rhs, (exp.Literal, exp.RawString)) or (
+                        isinstance(rhs, exp.Literal) and not rhs.is_string
+                    ):
+                        raise NotImplementedError(expression.sql(dialect="snowflake"))
+                    tag = rhs.name
+                new = SUCCESS_NOP.copy()
+                new.args["set_query_tag"] = tag
                 return new
 
         raise NotImplementedError(expression.sql(dialect="snowflake"))

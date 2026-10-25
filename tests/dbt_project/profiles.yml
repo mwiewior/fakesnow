@@ -1,0 +1,17 @@
+fsproj:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: fakesnow
+      user: fake
+      password: snow
+      role: SYSADMIN
+      warehouse: WH
+      database: DBT_DB
+      schema: ANALYTICS
+      threads: 4
+      # set by tests in server mode, empty (and ignored by fakesnow) in patch mode
+      host: "{{ env_var('FAKESNOW_HOST', '') }}"
+      port: "{{ env_var('FAKESNOW_PORT', '443') | as_number }}"
+      protocol: "{{ env_var('FAKESNOW_PROTOCOL', '') }}"

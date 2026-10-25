@@ -4,6 +4,7 @@ from fakesnow.transforms.ddl import (
     alter_table_add_multiple_columns as alter_table_add_multiple_columns,
     alter_table_strip_cluster_by as alter_table_strip_cluster_by,
     create_table_autoincrement as create_table_autoincrement,
+    swap_table as swap_table,
 )
 from fakesnow.transforms.file_format import (
     create_file_format as create_file_format,
@@ -13,6 +14,7 @@ from fakesnow.transforms.show import (
     show_columns as show_columns,
     show_databases as show_databases,
     show_functions as show_functions,
+    show_grants as show_grants,
     show_keys as show_keys,
     show_parameters as show_parameters,
     show_procedures as show_procedures,
@@ -28,6 +30,7 @@ from fakesnow.transforms.stage import (
     list_stage as list_stage,
     put_stage as put_stage,
 )
+from fakesnow.transforms.temporary import temporary_objects as temporary_objects
 from fakesnow.transforms.transforms import (
     SERVER_VERSION as SERVER_VERSION,
     SUCCESS_NOP as SUCCESS_NOP,
@@ -54,6 +57,7 @@ from fakesnow.transforms.transforms import (
     flatten as flatten,
     flatten_value_cast_as_varchar as flatten_value_cast_as_varchar,
     float_to_double as float_to_double,
+    grant_revoke as grant_revoke,
     haversine as haversine,
     hex_string as hex_string,
     identifier as identifier,
@@ -75,9 +79,11 @@ from fakesnow.transforms.transforms import (
     sample as sample,
     semi_structured_types as semi_structured_types,
     sequence_nextval as sequence_nextval,
+    session_context as session_context,
     set_schema as set_schema,
     sha256 as sha256,
     split as split,
+    system_cancel_all_queries as system_cancel_all_queries,
     tag as tag,
     timestamp_ntz as timestamp_ntz,
     timestamp_offsets as timestamp_offsets,

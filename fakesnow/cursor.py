@@ -67,6 +67,11 @@ SQL_COPY_ROWS = Template(
 )
 
 
+def _escape_literal(text: str) -> str:
+    """Escape text for a single-quoted SQL string literal, eg: a quoted identifier in a status message."""
+    return text.replace("'", "''")
+
+
 # The result columns snowflake reports when asked to describe a statement without running it.
 # The counts are placeholders, only the column names and types are used.
 DESCRIBE_RESULT_SQL: dict[type[Expr], str] = {
@@ -301,9 +306,20 @@ class FakeSnowflakeCursor:
         return (
             expression.transform(lambda e: transforms.identifier(e, params), copy=False)
             .transform(transforms.upper_case_unquoted_identifiers, copy=False)
+            .transform(
+                lambda e: transforms.temporary_objects(
+                    e, self._conn.temporaries, self._conn.database, self._conn.schema, self._duck_conn
+                ),
+                copy=False,
+            )
             .transform(transforms.alter_session, copy=False)
             .transform(transforms.update_variables, variables=self._conn.variables, copy=False)
             .transform(transforms.current_version, copy=False)
+            .transform(
+                lambda e: transforms.session_context(e, self._conn.role, self._conn.warehouse),
+                copy=False,
+            )
+            .transform(lambda e: transforms.system_cancel_all_queries(e, self._conn.session_id), copy=False)
             .transform(transforms.set_schema, current_database=self._conn.database, copy=False)
             .transform(transforms.create_database, db_path=self._conn.db_path, copy=False)
             .transform(transforms.extract_comment_on_table, copy=False)
@@ -351,8 +367,24 @@ class FakeSnowflakeCursor:
             .transform(transforms.datediff_string_literal_timestamp_cast, copy=False)
             .transform(transforms.show_databases, copy=False)
             .transform(transforms.show_functions, copy=False)
+            .transform(
+                lambda e: transforms.show_grants(
+                    e,
+                    self._conn.database,
+                    self._conn.schema,
+                    self._conn.role,
+                    self._duck_conn,
+                    self._conn.temporaries,
+                    self._conn.owners,
+                ),
+                copy=False,
+            )
+            .transform(
+                lambda e: transforms.grant_revoke(e, self._duck_conn, self._conn.database, self._conn.schema),
+                copy=False,
+            )
             .transform(transforms.show_procedures, copy=False)
-            .transform(transforms.show_parameters, copy=False)
+            .transform(lambda e: transforms.show_parameters(e, self._conn.query_tag), copy=False)
             .transform(transforms.show_warehouses, copy=False)
             .transform(lambda e: transforms.show_schemas(e, self._conn.database), copy=False)
             .transform(lambda e: transforms.show_tables_etc(e, self._conn.database, self._conn.schema), copy=False)
@@ -407,6 +439,12 @@ class FakeSnowflakeCursor:
         overwrite_result = transforms.insert_overwrite(expression)
         if len(overwrite_result) > 1:
             return overwrite_result
+
+        swap_result = transforms.swap_table(
+            expression, self._conn.database, self._conn.schema, self._duck_conn, self._conn.temporaries
+        )
+        if swap_result != [expression]:
+            return swap_result
 
         # Return original expression if no transform applied
         return [expression]
@@ -493,6 +531,7 @@ class FakeSnowflakeCursor:
                     self._conn.schema,
                     transformed,
                     self._conn.table_stages,
+                    self._conn.temporaries,
                     params,
                 )
             elif transformed.args.get("create_file_format_name"):
@@ -534,7 +573,10 @@ class FakeSnowflakeCursor:
             msg = cast(str, e.args[0]).split("\n")[0]
             raise snowflake.connector.errors.ProgrammingError(msg=msg, errno=100035, sqlstate="22007") from e
 
-        self._conn.table_stages.record_temporary_table(transformed, self._conn.database, self._conn.schema)
+        if temporary_owner := transformed.args.get("temporary_owner"):
+            self._conn.temporaries.record(transformed, *temporary_owner)
+
+        self._record_owner(transformed)
 
         if set_database := transformed.args.get("set_database"):
             self._conn.database = set_database
@@ -546,6 +588,15 @@ class FakeSnowflakeCursor:
             self._conn._schema = set_schema
             self._conn.schema_set = True
             result_sql = SQL_SUCCESS
+
+        elif set_role := transformed.args.get("set_role"):
+            self._conn.role = set_role
+
+        elif set_warehouse := transformed.args.get("set_warehouse"):
+            self._conn.warehouse = set_warehouse
+
+        elif (set_query_tag := transformed.args.get("set_query_tag")) is not None:
+            self._conn.query_tag = set_query_tag
 
         elif (set_autocommit := transformed.args.get("set_autocommit")) is not None:
             self._conn.autocommit(set_autocommit)
@@ -620,16 +671,17 @@ class FakeSnowflakeCursor:
                 self._conn.database_set = True
                 self._conn._schema = schema
                 self._conn.schema_set = True
-                result_sql = SQL_CREATED_SCHEMA.substitute(name=ident)
+                result_sql = SQL_CREATED_SCHEMA.substitute(name=_escape_literal(ident))
 
             elif cmd == "CREATE SEQUENCE" and ident:
-                result_sql = SQL_CREATED_SEQUENCE.substitute(name=ident)
+                result_sql = SQL_CREATED_SEQUENCE.substitute(name=_escape_literal(ident))
 
             elif cmd == "CREATE TABLE" and ident:
-                result_sql = SQL_CREATED_TABLE.substitute(name=ident)
+                result_sql = SQL_CREATED_TABLE.substitute(name=_escape_literal(ident))
 
-                # a newly created table object has no load history
-                if table := transformed.find(exp.Table):
+                # a newly created table object has no load history. history is keyed by the Snowflake name, which a
+                # temporary table shares with any permanent one, and the temporary table's qualifiers are stripped.
+                if not transformed.args.get("temporary_owner") and (table := transformed.find(exp.Table)):
                     catalog = table.catalog or self._conn.database
                     schema = table.db or self._conn.schema
                     assert catalog and schema
@@ -643,10 +695,10 @@ class FakeSnowflakeCursor:
                 result_sql = SQL_SUCCESS
 
             elif cmd == "CREATE VIEW" and ident:
-                result_sql = SQL_CREATED_VIEW.substitute(name=ident)
+                result_sql = SQL_CREATED_VIEW.substitute(name=_escape_literal(ident))
 
             elif cmd.startswith("DROP") and ident:
-                result_sql = SQL_DROPPED.substitute(name=ident)
+                result_sql = SQL_DROPPED.substitute(name=_escape_literal(ident))
 
                 # if dropping the current database/schema then reset conn metadata
                 if cmd == "DROP DATABASE" and ident == self._conn.database:
@@ -665,16 +717,41 @@ class FakeSnowflakeCursor:
             secret_name = match[1].upper() if match else "UNKNOWN"
             result_sql = SQL_CREATED_SECRET.substitute(name=secret_name)
 
-        if table_comment := cast(tuple[exp.Table, str], transformed.args.get("table_comment")):
+        # Temporary objects live in DuckDB's temp catalog, which the information schema doesn't report, so their
+        # comment and text lengths aren't recorded. Under their Snowflake name they'd replace a permanent table's.
+        created_temporary = bool(transformed.args.get("temporary_owner"))
+
+        def names_temporary(table: exp.Table) -> bool:
+            # a permanent CREATE's target is the new permanent table, even when a temporary one has its name
+            return created_temporary or (not isinstance(transformed, exp.Create) and self._is_temporary(table))
+
+        if (table_comment := cast(tuple[exp.Table, str], transformed.args.get("table_comment"))) and not (
+            names_temporary(table_comment[0])
+        ):
             # record table comment
             table, comment = table_comment
             catalog = table.catalog or self._conn.database
             schema = table.db or self._conn.schema
             assert catalog and schema
             self._duck_conn.execute(info_schema.insert_table_comment_sql(catalog, schema, table.name, comment))
+        if table_comment and isinstance(transformed, exp.Select):
+            # COMMENT ON, or ALTER ... SET COMMENT, replaced by a no-op, reports success whether or not it was recorded
+            result_sql = SQL_SUCCESS
 
-        if (text_lengths := cast(list[tuple[str, int]], transformed.args.get("text_lengths"))) and (
-            table := transformed.find(exp.Table)
+        if transformed.args.get("swap_metadata") and isinstance(transformed, exp.Alter):
+            # comments, text lengths and load history are keyed by table name, so they follow the tables. This is
+            # the second table renamed to the first one's name.
+            table = cast(exp.Table, transformed.this)
+            rename = cast(exp.AlterRename, transformed.args["actions"][0])
+            catalog = table.catalog or self._conn.database
+            schema = table.db or self._conn.schema
+            assert catalog and schema
+            self._duck_conn.execute(info_schema.swap_table_metadata_sql(catalog, schema, table.name, rename.this.name))
+
+        if (
+            (text_lengths := cast(list[tuple[str, int]], transformed.args.get("text_lengths")))
+            and (table := transformed.find(exp.Table))
+            and not names_temporary(table)
         ):
             # record text lengths
             catalog = table.catalog or self._conn.database
@@ -706,6 +783,37 @@ class FakeSnowflakeCursor:
             self._last_params,
             self._last_transformed,
         )
+
+    def _is_temporary(self, table: exp.Table) -> bool:
+        """Whether a table reference, after the temporary objects transform, names a session temporary object."""
+        if table.catalog.lower() == "temp":
+            # a qualified reference to a temporary object is rewritten to temp.main
+            return True
+        # an unqualified one is left as it is when it resolves to the temporary object
+        current = (self._conn.database, self._conn.schema)
+        return not table.db and self._conn.temporaries.owner(table.name) == current
+
+    def _record_owner(self, transformed: Expr) -> None:
+        """Record the session role as the owner of a database, schema, table or view just created."""
+        if create_db_name := transformed.args.get("create_db_name"):
+            kind, names = "DATABASE", [create_db_name]
+        elif (
+            isinstance(transformed, exp.Create)
+            and (kind := str(transformed.args.get("kind")).upper()) in ("SCHEMA", "TABLE", "VIEW")
+            and transformed.this
+            and (table := transformed.this.find(exp.Table))
+        ):
+            if kind == "SCHEMA":
+                names = [table.catalog or self._conn.database, table.db]
+            elif transformed.args.get("temporary_owner"):
+                # temporary objects live in the session's temp catalog
+                names = ["temp", "main", table.name]
+            else:
+                names = [table.catalog or self._conn.database, table.db or self._conn.schema, table.name]
+        else:
+            return
+        if all(names):
+            self._conn.owners.record(self._duck_conn, kind, cast(list[str], names), self._conn.role)
 
     def executemany(
         self,

@@ -956,6 +956,25 @@ def test_use() -> None:
     )
 
 
+def test_set_schema_use_role_keeps_quoted_case() -> None:
+    expression = sqlglot.parse_one('use role "Analyst"', read="snowflake").transform(
+        set_schema, current_database="marts"
+    )
+    assert expression.args["set_role"] == "Analyst"
+
+
+def test_set_schema_use_role_uppercases_unquoted() -> None:
+    expression = sqlglot.parse_one("use role analyst", read="snowflake").transform(set_schema, current_database="marts")
+    assert expression.args["set_role"] == "ANALYST"
+
+
+def test_set_schema_use_warehouse_keeps_quoted_case() -> None:
+    expression = sqlglot.parse_one('use warehouse "Wh"', read="snowflake").transform(
+        set_schema, current_database="marts"
+    )
+    assert expression.args["set_warehouse"] == "Wh"
+
+
 def test__get_to_number_args() -> None:
     default_precision = exp.Literal(this="38", is_string=False)
     default_scale = exp.Literal(this="0", is_string=False)

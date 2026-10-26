@@ -376,6 +376,16 @@ def test_number_38_0_is_int(cur: snowflake.connector.cursor.SnowflakeCursor):
     assert isinstance(results[0][0], int)
 
 
+def test_number_38_0_holds_38_digits(cur: snowflake.connector.cursor.SnowflakeCursor):
+    cur.execute("create or replace table example (i1 number(38,0), i2 bigint)")
+    big = 99999999999999999999999999999999999999
+    cur.execute(f"insert into example values ({big}, -{big}), (null, 1)")
+    cur.execute("select * from example order by i2")
+    results = cur.fetchall()
+    assert results == [(big, -big), (None, 1)]
+    assert isinstance(results[0][0], int)
+
+
 def test_non_existent_table_throws_snowflake_exception(cur: snowflake.connector.cursor.SnowflakeCursor):
     with pytest.raises(snowflake.connector.errors.ProgrammingError) as _:
         cur.execute("select * from this_table_does_not_exist")
@@ -758,6 +768,45 @@ def test_numeric_aggs_varchar_implicit_cast(dcur: snowflake.connector.cursor.Dic
     assert row["STDDEV_POP(AMOUNT)"] == 81.64965809277261
     assert row["VARIANCE_POP(AMOUNT)"] == 6666.666666666667
     assert row["MEDIAN(AMOUNT)"] == 200.0
+
+
+def test_numeric_aggs_keep_a_number_exact(cur: snowflake.connector.cursor.SnowflakeCursor):
+    """Snowflake sums a NUMBER exactly; only a non-numeric argument is cast to DOUBLE."""
+    cur.execute("CREATE TABLE t_exact_agg (n NUMBER(12,2), i INT, v VARCHAR)")
+    cur.execute("INSERT INTO t_exact_agg VALUES (1.25, 1, '1.5'), (2.10, 2, '2')")
+
+    cur.execute("SELECT SUM(n), SUM(i), SUM(v) FROM t_exact_agg")
+    [(n, i, v)] = cur.fetchall()
+    assert (n, i, v) == (Decimal("3.35"), 3, 3.5)
+    assert isinstance(n, Decimal) and isinstance(i, int)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH c AS (SELECT n FROM t_exact_from) SELECT SUM(n) FROM c",
+        "SELECT SUM(n) FROM (SELECT * FROM t_exact_from) AS s",
+        "SELECT SUM(x.n) FROM t_exact_from x JOIN t_exact_from y ON x.i = y.i",
+        "SELECT SUM(n) FROM db1.schema1.t_exact_from",
+    ],
+)
+def test_numeric_aggs_keep_a_number_exact_through_ctes_subqueries_and_joins(
+    cur: snowflake.connector.cursor.SnowflakeCursor, sql: str
+):
+    cur.execute("CREATE TABLE t_exact_from (n NUMBER(12,2), i INT)")
+    cur.execute("INSERT INTO t_exact_from VALUES (1.25, 1), (2.10, 2)")
+
+    cur.execute(sql)
+    assert cur.fetchall() == [(Decimal("3.35"),)]
+
+
+def test_numeric_aggs_cast_varchar_inside_a_transaction(cur: snowflake.connector.cursor.SnowflakeCursor):
+    cur.execute("CREATE TABLE t_tx_agg (v VARCHAR)")
+    cur.execute("BEGIN")
+    cur.execute("INSERT INTO t_tx_agg VALUES ('1.5'), ('2')")
+    cur.execute("WITH c AS (SELECT v FROM t_tx_agg) SELECT SUM(v) FROM c")
+    assert cur.fetchall() == [(3.5,)]
+    cur.execute("COMMIT")
 
 
 def test_insert_overwrite(dcur: snowflake.connector.cursor.DictCursor):

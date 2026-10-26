@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Collection
 from pathlib import Path
 from string import Template
 from typing import cast
@@ -9,6 +10,9 @@ import snowflake.connector.errors
 import sqlglot
 from duckdb import DuckDBPyConnection
 from sqlglot import Expr, exp
+from sqlglot.optimizer.annotate_types import annotate_types
+from sqlglot.optimizer.qualify import qualify
+from sqlglot.schema import MappingSchema
 
 from fakesnow.expr import normalise_ident
 from fakesnow.params import MutableParams, pop_qmark_param
@@ -850,17 +854,24 @@ NUMBER_38_0 = [
 
 
 def integer_precision(expression: Expr) -> Expr:
-    """Convert integers and number(38,0) to bigint.
+    """Convert integers and number(38,0) to hugeint.
 
-    So fetch_all will return int and dataframes will return them with a dtype of int64.
+    Snowflake's integer types are all NUMBER(38,0), which holds 38 digits; duckdb's bigint holds 19, its
+    hugeint 38. fetch_all returns int, and the server sends a column whose values fit as int64, so
+    dataframes have a dtype of int64 as from Snowflake.
     """
     if (
         isinstance(expression, exp.DataType)
         and expression.this == exp.DataType.Type.DECIMAL
         and (not expression.expressions or expression.expressions == NUMBER_38_0)
-    ) or expression.this in (exp.DataType.Type.INT, exp.DataType.Type.SMALLINT, exp.DataType.Type.TINYINT):
+    ) or expression.this in (
+        exp.DataType.Type.BIGINT,
+        exp.DataType.Type.INT,
+        exp.DataType.Type.SMALLINT,
+        exp.DataType.Type.TINYINT,
+    ):
         return exp.DataType(
-            this=exp.DataType.Type.BIGINT,
+            this=exp.DataType.Type.INT128,
             nested=False,
             prefix=False,
         )
@@ -1831,7 +1842,7 @@ def _numeric_agg_col_name(expression: Expr, arg: Expr) -> str | None:
     return f"{function_name}({arg.sql(dialect='snowflake').upper()})"
 
 
-def numeric_agg_implicit_cast(expression: Expr) -> Expr:
+def numeric_agg_implicit_cast(expression: Expr, numeric: Collection[int] = ()) -> Expr:
     """Wrap arguments to numeric aggregate functions with TRY_CAST(... AS DOUBLE).
 
     Snowflake implicitly casts VARCHAR to numeric when used in aggregate functions
@@ -1839,7 +1850,9 @@ def numeric_agg_implicit_cast(expression: Expr) -> Expr:
     transform adds an explicit TRY_CAST to match Snowflake's behavior while
     preserving Snowflake-style column names for rewritten select projections.
 
-    Only applies when the argument is not already a Cast/TryCast expression.
+    Only applies when the argument is not already a Cast/TryCast expression, nor known to be a number:
+    `numeric` holds the ids of the aggregates whose argument is (see numeric_agg_args), which Snowflake
+    aggregates exactly, eg: the SUM of a NUMBER(12,2) is a NUMBER, not a FLOAT.
 
     Example:
         >>> import sqlglot
@@ -1849,8 +1862,8 @@ def numeric_agg_implicit_cast(expression: Expr) -> Expr:
     if isinstance(expression, _NUMERIC_ONLY_AGGS):
         arg = expression.this
         col_name = None if isinstance(expression.parent, exp.Alias) else _numeric_agg_col_name(expression, arg)
-        # Don't double-cast if already cast
-        if not isinstance(arg, (exp.Cast, exp.TryCast)):
+        # Don't double-cast if already cast, nor cast a number
+        if not isinstance(arg, (exp.Cast, exp.TryCast)) and id(expression) not in numeric:
             expression.set(
                 "this",
                 exp.TryCast(this=arg, to=exp.DataType(this=exp.DataType.Type.DOUBLE)),
@@ -1858,6 +1871,44 @@ def numeric_agg_implicit_cast(expression: Expr) -> Expr:
         if col_name and isinstance(expression.parent, exp.Select):
             return exp.alias_(expression, col_name, quoted=True)
     return expression
+
+
+def numeric_agg_args(expression: Expr, columns: Callable[[set[tuple[str, str, str]]], MappingSchema]) -> set[int]:
+    """The ids of the numeric aggregates in expression whose argument is known to be a number.
+
+    They are ids of expression's own nodes, so expression is transformed in place (copy=False) after.
+
+    The argument types come from sqlglot, through CTEs, subqueries, joins and aliases, with the
+    referenced tables' columns from `columns` (their catalog, db and name, upper case). An aggregate
+    whose type can't be known is left out, so it is cast as before.
+    """
+    aggs = list(expression.find_all(*_NUMERIC_ONLY_AGGS))
+    if not aggs:
+        return set()
+    try:
+        typed = expression.copy()
+        ctes = {cte.alias_or_name.upper() for cte in typed.find_all(exp.CTE)}
+        tables = {
+            (t.catalog.upper(), t.db.upper(), t.name.upper())
+            for t in typed.find_all(exp.Table)
+            if t.name and t.name.upper() not in ctes
+        }
+        schema = columns(tables)
+        typed = annotate_types(
+            qualify(typed, schema=schema, dialect="snowflake", validate_qualify_columns=False),
+            schema=schema,
+            dialect="snowflake",
+        )
+        typed_aggs = list(typed.find_all(*_NUMERIC_ONLY_AGGS))
+    except Exception:
+        return set()
+    if len(typed_aggs) != len(aggs):
+        return set()
+    return {
+        id(agg)
+        for agg, typed_agg in zip(aggs, typed_aggs, strict=True)
+        if typed_agg.this.type and typed_agg.this.type.is_type(*exp.DataType.NUMERIC_TYPES)
+    }
 
 
 # a numeric utc offset at the end of a timestamp literal, ie: " +09:00", " -0700", " Z"

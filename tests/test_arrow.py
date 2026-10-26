@@ -63,6 +63,15 @@ def test_ipc() -> None:
 # TODO: cover to_sf
 
 
+def test_timestamp_to_sf_struct_keeps_nulls():
+    timestamps = [datetime.datetime(2013, 4, 5, 1, 2, 3, 123456), None]
+
+    for type_ in (pa.timestamp("us"), pa.timestamp("us", tz="UTC")):
+        result = timestamp_to_sf_struct(pa.array(timestamps, type=type_))
+
+        assert result.is_null().to_pylist() == [False, True]
+
+
 def test_timestamp_to_sf_struct():
     timestamp = datetime.datetime(2013, 4, 5, 1, 2, 3, 123456, tzinfo=pytz.utc)
     # this is what duckdb returns

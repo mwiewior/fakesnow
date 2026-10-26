@@ -100,6 +100,44 @@ def test_server_binding_timestamp_ltz(server: dict) -> None:
         assert cur.fetchone() == (timestamp,)
 
 
+def test_server_null_timestamps(scur: snowflake.connector.cursor.SnowflakeCursor) -> None:
+    scur.execute("create or replace table example (ntz timestamp_ntz, tz timestamp_tz, ltz timestamp_ltz)")
+    scur.execute("insert into example values (null, null, null), ('2026-01-01 10:00:00', null, null)")
+
+    scur.execute("select * from example order by ntz nulls first")
+    assert scur.fetchall() == [(None, None, None), (datetime.datetime(2026, 1, 1, 10), None, None)]
+
+
+def test_server_number_38_0_holds_38_digits(scur: snowflake.connector.cursor.SnowflakeCursor) -> None:
+    # snowflake's integer types are all NUMBER(38,0)
+    scur.execute("create or replace table example (n number(38,0), i int, b bigint)")
+    big = 12345678901234567890123456789012345678
+    scur.execute(f"insert into example values ({big}, -{big}, {big}), (1, 2, 3)")
+
+    scur.execute("select * from example order by i")
+    assert scur.fetchall() == [(big, -big, big), (1, 2, 3)]
+    scur.execute("select n + 1, i * 1 from example where n = 1")
+    assert scur.fetchall() == [(2, 2)]
+    scur.execute("select sum(n), count(*) from example where n = 1")
+    assert scur.fetchall() == [(1, 1)]
+
+
+def test_server_number_38_0_fetches_as_int64_when_it_fits(scur: snowflake.connector.cursor.SnowflakeCursor) -> None:
+    scur.execute("create or replace table example (n number(38,0))")
+    scur.execute("insert into example values (1), (9223372036854775807)")
+
+    scur.execute("select n from example")
+    assert str(scur.fetch_pandas_all()["N"].dtype) == "int64"
+
+
+def test_server_sum_of_a_number_is_exact(scur: snowflake.connector.cursor.SnowflakeCursor) -> None:
+    scur.execute("create or replace table example (n number(12,2))")
+    scur.execute("insert into example values (1234.50), (-0.01), (100)")
+
+    scur.execute("select sum(n) from example")
+    assert scur.fetchall() == [(Decimal("1334.49"),)]
+
+
 def test_server_binding_named(server: dict) -> None:
     with snowflake.connector.connect(**server, database="DB1", schema="SCHEMA1") as conn:
         with conn.cursor() as cur:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import tempfile
+import threading
 
 import pytest
 import snowflake.connector
@@ -79,6 +80,20 @@ def test_connect_concurrently(_fakesnow: None) -> None:
             # exceptions if any will be raised here. we want to avoid
             # duckdb.duckdb.TransactionException: TransactionContext Error: Catalog write-write conflict
             _ = future.result()
+
+
+def test_connect_concurrently_to_new_database_and_schema(_fakesnow: None) -> None:
+    # eg: dbt with threads > 1 opens connections at once, each creating the database and schema
+    threads = 8
+    barrier = threading.Barrier(threads)
+
+    def connect() -> None:
+        barrier.wait()
+        snowflake.connector.connect(database="newdb", schema="newschema").close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        for future in [executor.submit(connect) for _ in range(threads)]:
+            future.result()
 
 
 def test_connect_db_path_can_create_database() -> None:
@@ -318,3 +333,27 @@ def test_use_qualified_schema_updates_current_database(dcur: snowflake.connector
     dcur.execute("SELECT CURRENT_DATABASE(), CURRENT_SCHEMA()")
 
     assert dcur.fetchall() == [{"current_database()": "DB2", "current_schema()": "SCHEMA2"}]
+
+
+def test_connect_with_query_tag_session_parameter(_fakesnow: None):
+    with snowflake.connector.connect(session_parameters={"QUERY_TAG": "dbt"}) as conn:
+        cur = conn.cursor(snowflake.connector.cursor.DictCursor)
+        cur.execute("SHOW PARAMETERS LIKE 'QUERY_TAG'")
+        assert cur.fetchall()[0]["value"] == "dbt"
+
+
+def test_current_role_from_connect(_fakesnow: None):
+    with snowflake.connector.connect(role="sysadmin") as conn:
+        assert conn.cursor().execute("select current_role()").fetchall() == [("SYSADMIN",)]
+
+
+def test_current_warehouse_from_connect(_fakesnow: None):
+    # assumes the warehouse exists: Snowflake leaves the current warehouse NULL for one that doesn't, while fakesnow
+    # treats every warehouse as existing
+    with snowflake.connector.connect(warehouse="wh") as conn:
+        assert conn.cursor().execute("select current_warehouse()").fetchall() == [("WH",)]
+
+
+def test_current_role_and_warehouse_defaults(_fakesnow: None):
+    with snowflake.connector.connect() as conn:
+        assert conn.cursor().execute("select current_role(), current_warehouse()").fetchall() == [("PUBLIC", None)]

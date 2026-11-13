@@ -95,13 +95,22 @@ def patch(
 
 @contextmanager
 def server(
-    port: int | None = None, host: str = "127.0.0.1", session_parameters: dict[str, str | int | bool] | None = None
+    port: int | None = None,
+    host: str = "127.0.0.1",
+    session_parameters: dict[str, str | int | bool] | None = None,
+    db_path: str | None = None,
 ) -> Iterator[dict]:
     """Start a fake snowflake server in a separate thread and yield connection kwargs.
 
     Args:
         port (int | None, optional): Port to run the server on. If None, an available port is chosen. Defaults to None.
         host (str): Host to run the server on. Defaults to "127.0.0.1".
+        db_path (str | None, optional): Default database path for logins that don't send FAKESNOW_DB_PATH.
+            Logins with the same path share one instance. The default is process-global, so concurrent
+            servers with different db_paths in one process aren't supported. Defaults to None (in-memory).
+
+    Raises:
+        NotADirectoryError: If db_path is not an existing directory.
 
     Yields:
         Iterator[dict]: Connection parameters for the fake snowflake server.
@@ -112,7 +121,14 @@ def server(
 
     import uvicorn
 
-    import fakesnow.server
+    # logins create the instance, so check now rather than fail every login
+    if db_path and not os.path.isdir(db_path):
+        raise NotADirectoryError(f"No such directory: '{db_path}'. Please ensure db_path exists.")
+
+    server_module = importlib.import_module("fakesnow.server")
+
+    # importing the submodule rebinds fakesnow.server to the module, so restore the function to keep it callable
+    globals()["server"] = _server
 
     # find an unused TCP port between 1024-65535
     if not port:
@@ -121,14 +137,16 @@ def server(
             port = sock.getsockname()[1]
 
     assert port
-    server = uvicorn.Server(uvicorn.Config(fakesnow.server.app, host=host, port=port, log_level="info"))
-    thread = threading.Thread(target=server.run, name="fakesnow server", daemon=True)
+    restore_default = server_module.set_default_db_path(db_path)
+    uvicorn_server = uvicorn.Server(uvicorn.Config(server_module.app, host=host, port=port, log_level="info"))
+    thread = threading.Thread(target=uvicorn_server.run, name="fakesnow server", daemon=True)
     thread.start()
 
-    while thread.is_alive() and not server.started:
+    while thread.is_alive() and not uvicorn_server.started:
         sleep(0.1)
 
-    if not server.started:
+    if not uvicorn_server.started:
+        restore_default()
         raise RuntimeError("Failed to start server")
 
     try:
@@ -145,6 +163,11 @@ def server(
             network_timeout=1,
         )
     finally:
-        server.should_exit = True
+        uvicorn_server.should_exit = True
         # wait for server thread to end
         thread.join()
+        restore_default()
+
+
+# the submodule fakesnow.server shadows the function of the same name once imported, so keep a reference
+_server = server

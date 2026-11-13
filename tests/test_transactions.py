@@ -182,6 +182,13 @@ def test_autocommit_create_file_format_does_not_commit_active_transaction(
             cur.execute("CREATE FILE FORMAT file_format_transaction_test TYPE='CSV'")
 
 
+def test_create_temporary_table_in_transaction(conn: snowflake.connector.SnowflakeConnection):
+    with conn.cursor() as cur:
+        cur.execute("BEGIN")
+        cur.execute("CREATE TEMPORARY TABLE temp_in_transaction (id int)")
+        assert cur.fetchall() == [("Table TEMP_IN_TRANSACTION successfully created.",)]
+
+
 def test_conn_autocommit_false(_fakesnow: None):
     # create table upfront
     with snowflake.connector.connect(database="db1", schema="schema1") as conn, conn.cursor() as cur:

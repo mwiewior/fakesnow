@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -59,6 +61,24 @@ def to_ipc(table: pa.Table) -> pa.Buffer:
     return sink.getvalue()
 
 
+def is_integer_decimal(t: pa.DataType) -> bool:
+    return pa.types.is_decimal(t) and t.scale == 0
+
+
+def fit_integers(table: pa.Table) -> pa.Table:
+    """Cast each NUMBER(p,0) column whose values fit to int64, as Snowflake sends it.
+
+    duckdb returns NUMBER(38,0) (a hugeint) and NUMBER(p,0) as decimal128(p,0); Snowflake sends a column as the
+    smallest integer that holds its values, so it fetches as int and dataframes have a dtype of int64. A column with
+    a value beyond int64 stays decimal128.
+    """
+    for i, field in enumerate(table.schema):
+        if is_integer_decimal(field.type):
+            with contextlib.suppress(pa.ArrowInvalid):
+                table = table.set_column(i, field.with_type(pa.int64()), table.column(i).cast(pa.int64()))
+    return table
+
+
 def to_sf(table: pa.Table, rowtype: list[ColumnInfo]) -> pa.Table:
     def to_sf_col(col: pa.ChunkedArray) -> pa.Array | pa.ChunkedArray:
         if pa.types.is_timestamp(col.type):
@@ -91,6 +111,12 @@ def timestamp_to_sf_struct(ts: pa.Array | pa.ChunkedArray) -> pa.Array:
     # Calculate fractional part as nanoseconds
     fraction = pc.round(pc.multiply(pc.subsecond(ts), 1_000_000_000)).cast(pa.int32())  # type: ignore
 
+    # a null timestamp is a null struct: its non-nullable fields hold 0, which the connector would
+    # otherwise read as the epoch
+    mask = ts.is_null()
+    epoch = epoch.fill_null(0)
+    fraction = fraction.fill_null(0)
+
     if ts.type.tz:
         assert ts.type.tz == "UTC", f"Timezone {ts.type.tz} not yet supported"
         timezone = pa.array([1440] * len(ts), type=pa.int32())
@@ -102,6 +128,7 @@ def timestamp_to_sf_struct(ts: pa.Array | pa.ChunkedArray) -> pa.Array:
                 pa.field("fraction", nullable=False, type=pa.int32()),
                 pa.field("timezone", nullable=False, type=pa.int32()),
             ],
+            mask=mask,
         )
     else:
         return pa.StructArray.from_arrays(
@@ -110,4 +137,5 @@ def timestamp_to_sf_struct(ts: pa.Array | pa.ChunkedArray) -> pa.Array:
                 pa.field("epoch", nullable=False, type=pa.int64()),
                 pa.field("fraction", nullable=False, type=pa.int32()),
             ],
+            mask=mask,
         )

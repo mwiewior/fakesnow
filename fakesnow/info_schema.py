@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import secrets
 from string import Template
+
+from sqlglot import exp
 
 SQL_CREATE_GLOBAL_FS_INFORMATION_SCHEMA = """
 create schema if not exists _fs_global._fs_information_schema
@@ -91,7 +94,7 @@ select
     columns.ordinal_position AS ORDINAL_POSITION,
     columns.column_default AS COLUMN_DEFAULT,
     columns.is_nullable AS IS_NULLABLE,
-case when starts_with(columns.data_type, 'DECIMAL') or columns.data_type='BIGINT' then 'NUMBER'
+case when starts_with(columns.data_type, 'DECIMAL') or columns.data_type in ('BIGINT', 'HUGEINT') then 'NUMBER'
      when columns.data_type='VARCHAR' then 'TEXT'
      when columns.data_type='DOUBLE' then 'FLOAT'
      when columns.data_type='BLOB' then 'BINARY'
@@ -100,10 +103,10 @@ case when starts_with(columns.data_type, 'DECIMAL') or columns.data_type='BIGINT
      when columns.data_type='JSON' then 'VARIANT'
      else columns.data_type end as DATA_TYPE,
 ext_character_maximum_length as CHARACTER_MAXIMUM_LENGTH, ext_character_octet_length as CHARACTER_OCTET_LENGTH,
-case when columns.data_type='BIGINT' then 38
+case when columns.data_type in ('BIGINT', 'HUGEINT') then 38
      when columns.data_type='DOUBLE' then NULL
     else columns.numeric_precision end as NUMERIC_PRECISION,
-case when columns.data_type='BIGINT' then 10
+case when columns.data_type in ('BIGINT', 'HUGEINT') then 10
     when columns.data_type='DOUBLE' then NULL
     else columns.numeric_precision_radix end as NUMERIC_PRECISION_RADIX,
 case when columns.data_type='DOUBLE' then NULL else columns.numeric_scale end as NUMERIC_SCALE,
@@ -125,6 +128,8 @@ LEFT JOIN duckdb_columns ddb_columns
  AND ddb_columns.table_name = columns.table_name
  AND ddb_columns.column_name = columns.column_name
 where schema_name != '_fs_information_schema'
+-- fakesnow's own temporary tables, eg: the session's temporary load history
+and not (columns.table_catalog = 'temp' and starts_with(columns.table_name, '_fs_'))
 """
 
 
@@ -262,6 +267,90 @@ create table if not exists ${catalog}._fs_information_schema._fs_load_history (
     """
 )
 
+# predecessors and finalize hold unqualified names of tasks in the same schema
+SQL_CREATE_TASKS_TABLE = Template(
+    """
+create table if not exists ${catalog}._fs_information_schema._fs_tasks (
+    created_on TIMESTAMPTZ,
+    name VARCHAR,
+    id VARCHAR,
+    schema_name VARCHAR,
+    owner VARCHAR,
+    comment VARCHAR,
+    warehouse VARCHAR,
+    schedule VARCHAR,
+    predecessors VARCHAR[],
+    state VARCHAR,
+    definition VARCHAR,
+    condition VARCHAR,
+    finalize VARCHAR,
+    config VARCHAR,
+    error_integration VARCHAR,
+    success_integration VARCHAR,
+    overlap_policy VARCHAR,
+    allow_overlapping_execution BOOLEAN,
+    properties JSON,
+    session_parameters JSON,
+    last_committed_on TIMESTAMPTZ,
+    last_suspended_on TIMESTAMPTZ,
+    last_suspended_reason VARCHAR,
+    created_by_user VARCHAR,
+    PRIMARY KEY (schema_name, name)
+)
+    """
+)
+
+# one row per task run by a graph run, the source of TASK_HISTORY. upper case column names are those of its result.
+SQL_CREATE_TASK_HISTORY_TABLE = Template(
+    """
+create table if not exists ${catalog}._fs_information_schema._fs_task_history (
+    QUERY_ID VARCHAR,
+    NAME VARCHAR,
+    SCHEMA_NAME VARCHAR,
+    QUERY_TEXT VARCHAR,
+    CONDITION_TEXT VARCHAR,
+    STATE VARCHAR,
+    ERROR_CODE INTEGER,
+    ERROR_MESSAGE VARCHAR,
+    SCHEDULED_TIME TIMESTAMPTZ,
+    QUERY_START_TIME TIMESTAMPTZ,
+    COMPLETED_TIME TIMESTAMPTZ,
+    ROOT_TASK_ID VARCHAR,
+    RUN_ID BIGINT,
+    RETURN_VALUE VARCHAR,
+    SCHEDULED_FROM VARCHAR,
+    ATTEMPT_NUMBER INTEGER,
+    CONFIG VARCHAR,
+    GRAPH_RUN_GROUP_ID VARCHAR,
+    SCHEDULED_BY_USER VARCHAR
+)
+    """
+)
+
+# one row per graph run, the source of COMPLETE_TASK_GRAPHS. upper case column names are those of its result.
+SQL_CREATE_TASK_GRAPH_RUNS_TABLE = Template(
+    """
+create table if not exists ${catalog}._fs_information_schema._fs_task_graph_runs (
+    ROOT_TASK_NAME VARCHAR,
+    SCHEMA_NAME VARCHAR,
+    STATE VARCHAR,
+    SCHEDULED_FROM VARCHAR,
+    FIRST_ERROR_TASK_NAME VARCHAR,
+    FIRST_ERROR_CODE INTEGER,
+    FIRST_ERROR_MESSAGE VARCHAR,
+    SCHEDULED_TIME TIMESTAMPTZ,
+    QUERY_START_TIME TIMESTAMPTZ,
+    COMPLETED_TIME TIMESTAMPTZ,
+    ROOT_TASK_ID VARCHAR,
+    RUN_ID BIGINT,
+    ATTEMPT_NUMBER INTEGER,
+    CONFIG VARCHAR,
+    GRAPH_RUN_GROUP_ID VARCHAR,
+    SCHEDULED_BY_USER VARCHAR
+)
+    """
+)
+
 
 SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_STAGES_TABLE = """
 CREATE TABLE IF NOT EXISTS _fs_global._fs_information_schema._fs_stages (
@@ -309,6 +398,9 @@ def per_db_creation_sql(catalog: str) -> str:
         {SQL_CREATE_INFORMATION_SCHEMA_SCHEMATA_VIEW.substitute(catalog=catalog)};
         {SQL_CREATE_INFORMATION_SCHEMA_VIEWS_VIEW.substitute(catalog=catalog)};
         {SQL_CREATE_LOAD_HISTORY_TABLE.substitute(catalog=catalog)};
+        {SQL_CREATE_TASKS_TABLE.substitute(catalog=catalog)};
+        {SQL_CREATE_TASK_HISTORY_TABLE.substitute(catalog=catalog)};
+        {SQL_CREATE_TASK_GRAPH_RUNS_TABLE.substitute(catalog=catalog)};
     """
 
 
@@ -320,7 +412,9 @@ def fs_global_creation_sql() -> str:
         {SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW};
         {SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_USERS_TABLE};
         {SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_STAGES_TABLE};
-        {SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_FILE_FORMATS_TABLE}
+        {SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_FILE_FORMATS_TABLE};
+        -- always empty, so an account-wide SHOW TASKS has a table to list when no database has one
+        {SQL_CREATE_TASKS_TABLE.substitute(catalog="_fs_global")}
     """
 
 
@@ -331,6 +425,32 @@ def insert_table_comment_sql(catalog: str, schema: str, table: str, comment: str
         ON CONFLICT (ext_table_catalog, ext_table_schema, ext_table_name)
         DO UPDATE SET comment = excluded.comment
     """
+
+
+def swap_table_metadata_sql(catalog: str, schema: str, table: str, other: str) -> str:
+    """Swap the recorded comments, column text lengths and load history of two tables, which are keyed by name."""
+
+    # names are quoted identifiers that may contain quotes, so they're escaped as literals
+    def lit(value: str) -> str:
+        return exp.Literal.string(value).sql(dialect="duckdb")
+
+    # via a placeholder name because the name is part of the key
+    tmp, table, other = lit(f"_fs_swap_{secrets.token_hex(8)}"), lit(table), lit(other)
+    ext_key = f"ext_table_catalog = {lit(catalog)} AND ext_table_schema = {lit(schema)}"
+    history = f"{exp.to_identifier(catalog).sql(dialect='duckdb')}._fs_information_schema._fs_load_history"
+    keyed = [
+        ("_fs_global._fs_information_schema._fs_tables_ext", ext_key, "ext_table_name"),
+        ("_fs_global._fs_information_schema._fs_columns_ext", ext_key, "ext_table_name"),
+        (history, f"SCHEMA_NAME = {lit(schema)}", "TABLE_NAME"),
+    ]
+    return ";".join(
+        f"""
+        UPDATE {ext} SET {name} = {tmp} WHERE {key} AND {name} = {table};
+        UPDATE {ext} SET {name} = {table} WHERE {key} AND {name} = {other};
+        UPDATE {ext} SET {name} = {other} WHERE {key} AND {name} = {tmp}
+        """
+        for ext, key, name in keyed
+    )
 
 
 def insert_text_lengths_sql(catalog: str, schema: str, table: str, text_lengths: list[tuple[str, int]]) -> str:

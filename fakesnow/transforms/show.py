@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import re
 from typing import Literal
 
+import snowflake.connector.errors
 import sqlglot
+from duckdb import DuckDBPyConnection
 from sqlglot import Expr, TokenType, exp
+
+from fakesnow.expr import normalise_ident
+from fakesnow.owners import Owners
+from fakesnow.temporary import TemporaryObjects
 
 
 def fs_global_creation_sql() -> str:
@@ -323,7 +330,118 @@ WHERE 0 = 1;
 """
 
 
-def show_parameters(expression: Expr) -> Expr:
+def _quoted(name: str) -> str:
+    """The name as Snowflake writes it in a qualified name: quoted unless it's an upper case identifier."""
+    return name if re.fullmatch(r"[A-Z_][A-Z0-9_$]*", name) else '"{}"'.format(name.replace('"', '""'))
+
+
+def show_grants(
+    expression: Expr,
+    current_database: str | None,
+    current_schema: str | None,
+    role: str,
+    duck_conn: DuckDBPyConnection,
+    temporaries: TemporaryObjects,
+    owners: Owners,
+) -> Expr:
+    """Transform SHOW GRANTS ON [<kind>] <name>.
+
+    Grants aren't tracked, so only the implicit OWNERSHIP grant held by the role that created the object is reported.
+    Objects whose creation wasn't seen, eg: reopened from db_path, are reported as owned by the session role. Without
+    a kind, as dbt renders it, the name is resolved as a table and then a view.
+
+    See https://docs.snowflake.com/en/sql-reference/sql/show-grants
+    """
+    if not (
+        isinstance(expression, exp.Command)
+        and isinstance(expression.this, str)
+        and expression.this.upper() == "SHOW"
+        and isinstance(expression.expression, str)
+    ):
+        return expression
+
+    text = expression.expression
+    tokens = sqlglot.tokenize(text, read="snowflake")
+    if not tokens or tokens[0].token_type != TokenType.VAR or tokens[0].text.upper() != "GRANTS":
+        return expression
+
+    if len(tokens) < 3 or tokens[1].token_type != TokenType.ON or tokens[2].text.upper() == "ACCOUNT":
+        raise NotImplementedError(expression.sql(dialect="snowflake"))
+    if len(tokens) > 3 and tokens[3].token_type != TokenType.DOT:
+        # ON <kind> <name>
+        kind, start = tokens[2].text.upper(), tokens[3].start
+        if kind not in ("TABLE", "VIEW", "SCHEMA", "DATABASE"):
+            raise NotImplementedError(expression.sql(dialect="snowflake"))
+    else:
+        # ON <name>, a table or view
+        kind, start = "", tokens[2].start
+
+    # parse the name from the original text so quoting is preserved
+    table = exp.to_table(text[start:], dialect="snowflake")
+    parts = [normalise_ident(p.sql(dialect="snowflake")) for p in reversed(table.parts)]
+    if len(parts) > {"TABLE": 3, "VIEW": 3, "SCHEMA": 2, "DATABASE": 1, "": 3}[kind]:
+        raise NotImplementedError(expression.sql(dialect="snowflake"))
+
+    # fill in unqualified leading parts from the session
+    # the session's names are already resolved, so quoted ones keep their case
+    session = [current_database, current_schema]
+    qualifiers = session[: {"TABLE": 2, "VIEW": 2, "SCHEMA": 1, "DATABASE": 0, "": 2}[kind]]
+    leading = qualifiers[: len(qualifiers) + 1 - len(parts)]
+    if not all(leading):
+        raise NotImplementedError(expression.sql(dialect="snowflake"))
+    names = [q for q in leading if q] + parts[::-1]
+
+    temporary = None
+    if kind == "DATABASE":
+        exists_sql = "SELECT 1 FROM _fs_global._fs_information_schema._fs_show_databases WHERE name = ?"
+        exists = duck_conn.execute(exists_sql, names).fetchone() is not None
+    elif kind == "SCHEMA":
+        exists_sql = (
+            "SELECT 1 FROM _fs_global._fs_information_schema._fs_show_schemas WHERE database_name = ? AND name = ?"
+        )
+        exists = duck_conn.execute(exists_sql, names).fetchone() is not None
+    else:
+        # temporary tables and views are kept out of the show views
+        temporary = temporaries.kind(names[2], names[0], names[1])
+        objects_sql = (
+            "SELECT kind FROM _fs_global._fs_information_schema._fs_show_objects "
+            "WHERE database_name = ? AND schema_name = ? AND name = ?"
+        )
+        kinds = {k for (k,) in duck_conn.execute(objects_sql, names).fetchall()}
+        if kind:
+            exists = bool(temporary) or kind in kinds
+        else:
+            kind = temporary or next((k for k in ("TABLE", "VIEW") if k in kinds), "")
+            exists = bool(kind)
+    if not exists:
+        fqname, label = ".".join(names), (kind or "object").capitalize()
+        raise snowflake.connector.errors.ProgrammingError(
+            msg=f"SQL compilation error:\n{label} '{fqname}' does not exist or not authorized.",
+            errno=2003,
+            sqlstate="42S02",
+        )
+
+    # a temporary object shadows a permanent one of the same name, and lives in the session's temp catalog
+    owner_kind, owner_names = (temporary, ["temp", "main", names[2]]) if temporary else (kind, names)
+    owner = owners.owner(duck_conn, owner_kind, owner_names) or role
+
+    # the catalog doesn't record creation time, so report the current time
+    query = f"""
+        SELECT
+            now()::timestamptz AS created_on,
+            'OWNERSHIP' AS privilege,
+            '{kind}' AS granted_on,
+            {exp.Literal.string(".".join(map(_quoted, names))).sql(dialect="duckdb")} AS name,
+            'ROLE' AS granted_to,
+            {exp.Literal.string(owner).sql(dialect="duckdb")} AS grantee_name,
+            'true' AS grant_option,
+            {exp.Literal.string(owner).sql(dialect="duckdb")} AS granted_by,
+            'ROLE' AS granted_by_role_type
+    """
+    return sqlglot.parse_one(query, read="duckdb")
+
+
+def show_parameters(expression: Expr, query_tag: str = "") -> Expr:
     """Transform SHOW PARAMETERS.
 
     Only session scope (the default, IN SESSION, or FOR SESSION) is supported.
@@ -358,12 +476,17 @@ def show_parameters(expression: Expr) -> Expr:
     ):
         raise NotImplementedError(expression.sql(dialect="snowflake"))
 
+    tag = exp.Literal.string(query_tag).sql(dialect="duckdb")
+    level = "'SESSION'" if query_tag else "''"
+
     # Only list supported parameters, so the reported values match behaviour.
-    query = """
+    query = f"""
         SELECT * FROM (VALUES
             ('QUOTED_IDENTIFIERS_IGNORE_CASE', 'false', 'false', '',
              'If true, the case of quoted identifiers is ignored', 'BOOLEAN'),
-            ('TIMEZONE', 'Etc/UTC', 'America/Los_Angeles', 'ACCOUNT', 'time zone', 'STRING')
+            ('TIMEZONE', 'Etc/UTC', 'America/Los_Angeles', 'ACCOUNT', 'time zone', 'STRING'),
+            ('QUERY_TAG', {tag}, '', {level},
+             'String (up to 2000 characters) used to tag statements executed by the session', 'STRING')
         ) AS parameters("key", "value", "default", "level", "description", "type")
     """
     if like is not None:
@@ -550,6 +673,8 @@ select
     'N' as is_iceberg
 from information_schema.tables
 where not (table_schema == '_fs_information_schema')
+-- fakesnow's own temporary tables, eg: the session's temporary load history
+and not (table_catalog = 'temp' and starts_with(table_name, '_fs_'))
 """
 
 # see https://docs.snowflake.com/en/sql-reference/sql/show-tables
@@ -584,6 +709,8 @@ select
     'N' as is_immutable
 from information_schema.tables
 where not (table_schema == '_fs_information_schema')
+-- fakesnow's own temporary tables, eg: the session's temporary load history
+and not (table_catalog = 'temp' and starts_with(table_name, '_fs_'))
 and table_type = 'BASE TABLE'
 """
 

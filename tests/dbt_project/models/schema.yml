@@ -1,0 +1,18 @@
+version: 2
+models:
+  - name: stg_orders
+    columns:
+      - name: id
+        data_tests:
+          - not_null
+          - unique
+  - name: orders_table
+    config:
+      grants:
+        select: ['PUBLIC']
+      query_tag: 'fsproj'
+  # an incremental run checks existing grants to revoke stale ones, with show grants on <relation>
+  - name: inc_merge
+    config:
+      grants:
+        select: ['PUBLIC']

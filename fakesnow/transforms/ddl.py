@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import secrets
 
+import snowflake.connector.errors
 import sqlglot
+from duckdb import DuckDBPyConnection
 from sqlglot import Expr, exp
 
+from fakesnow.temporary import TemporaryObjects
 from fakesnow.transforms.transforms import SUCCESS_NOP
 
 
@@ -61,6 +64,96 @@ def alter_table_add_multiple_columns(
         alter_statements.append(new_alter)
 
     return alter_statements
+
+
+_KIND_SQL = """
+    SELECT kind FROM _fs_global._fs_information_schema._fs_show_objects
+    WHERE database_name = ? AND schema_name = ? AND name = ?
+"""
+
+
+def swap_table(
+    expression: Expr,
+    current_database: str | None,
+    current_schema: str | None,
+    duck_conn: DuckDBPyConnection,
+    temporaries: TemporaryObjects,
+) -> list[Expr]:
+    """Transform ALTER TABLE a SWAP WITH b, which duckdb lacks, into renames through a temporary name.
+
+    a -> tmp, b -> a, tmp -> b. The b -> a rename carries swap_metadata so the cursor can swap permanent tables'
+    recorded comments, text lengths and load history, which are keyed by name. Both operands are checked to be tables,
+    and read so that a missing one fails, before anything is renamed.
+    """
+    if not (
+        isinstance(expression, exp.Alter)
+        and expression.args.get("kind") == "TABLE"
+        and isinstance(expression.this, exp.Table)
+        and len(actions := expression.args.get("actions") or []) == 1
+        and isinstance(actions[0], exp.SwapTable)
+    ):
+        return [expression]
+
+    first = expression.this
+    second = actions[0].this
+
+    # unquoted identifiers are case-insensitive, quoted ones are not
+    def fold(part: exp.Expr) -> str:
+        return part.name if part.args.get("quoted") else part.name.upper()
+
+    def location(table: exp.Table) -> tuple[str | None, str | None]:
+        catalog = table.args.get("catalog")
+        schema = table.args.get("db")
+        return (fold(catalog) if catalog else current_database, fold(schema) if schema else current_schema)
+
+    if location(first) != location(second):
+        raise NotImplementedError("ALTER TABLE ... SWAP WITH across databases or schemas")
+    if first.name.upper() == second.name.upper():
+        # swapping a table with itself changes nothing. duckdb names are case-insensitive, so this is checked first.
+        return [SUCCESS_NOP.copy()]
+    catalog, schema = location(first)
+    temporary: list[bool] = []
+    for operand in (first, second):
+        name = fold(operand.this)
+        # a temporary object shadows a permanent one of the same name
+        kind = temporaries.kind(name, catalog, schema) if catalog and schema else None
+        temporary.append(bool(kind))
+        if not kind and (row := duck_conn.execute(_KIND_SQL, [catalog, schema, name]).fetchone()):
+            kind = row[0]
+        if kind and kind != "TABLE":
+            # duckdb would rename a view as though it were a table
+            raise snowflake.connector.errors.ProgrammingError(
+                msg=f"SQL compilation error: Object found is of type '{kind}', not specified type 'TABLE'.",
+                errno=2203,
+                sqlstate="02000",
+            )
+    if temporary[0] != temporary[1]:
+        # see https://docs.snowflake.com/en/sql-reference/sql/alter-table#parameters
+        raise snowflake.connector.errors.ProgrammingError(
+            msg="Swapping of a temporary table with another non-temporary table is not allowed.",
+            errno=1486,
+            sqlstate="42601",
+        )
+
+    # rename to takes an unqualified name, and the new name must be in the same schema as the table
+    tmp = f"_fs_swap_{secrets.token_hex(8)}"
+    qualifiers = {"catalog": first.args.get("catalog"), "db": first.args.get("db")}
+
+    def table(name: str | exp.Identifier) -> exp.Table:
+        return exp.Table(this=exp.to_identifier(name), **{k: v.copy() for k, v in qualifiers.items() if v})
+
+    def rename(source: str | exp.Identifier, target: str | exp.Identifier) -> exp.Alter:
+        return exp.Alter(
+            this=table(source),
+            kind="TABLE",
+            actions=[exp.AlterRename(this=exp.Table(this=exp.to_identifier(target)))],
+        )
+
+    second_to_first = rename(second.this, first.this)
+    # temporary tables have no recorded metadata, and their names would swap the permanent tables' metadata
+    second_to_first.set("swap_metadata", not any(temporary))
+    probes = [exp.select("1").from_(t.copy()).where(exp.false()) for t in (first, second)]
+    return [*probes, rename(first.this, tmp), second_to_first, rename(tmp, second.this)]
 
 
 def _is_alter_table_cluster_by(expression: Expr) -> bool:

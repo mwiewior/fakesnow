@@ -77,11 +77,16 @@ def main(args: Sequence[str] = sys.argv[1:]) -> int:
         signal.signal(signal.SIGINT, signal_handler)
 
         try:
-            with fakesnow.server(port=getattr(pargs, "port", None), host=getattr(pargs, "host", "127.0.0.1")):
+            with fakesnow.server(
+                port=getattr(pargs, "port", None), host=getattr(pargs, "host", "127.0.0.1"), db_path=pargs.db_path
+            ):
                 # wait for SIGINT
                 stop.wait()
         except RuntimeError:
             # catch to avoid showing traceback since uvicorn will log the error
+            return 1
+        except NotADirectoryError as e:
+            print(e, file=sys.stderr)
             return 1
 
         return 0

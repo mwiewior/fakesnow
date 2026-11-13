@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import snowflake.connector.errors
 from sqlglot import Expr, exp
 from sqlglot.optimizer.scope import traverse_scope
 
@@ -20,6 +21,22 @@ def is_unqualified_table_expression(expression: Expr) -> tuple[bool, bool]:
         no_schema |= missing_schema
 
     return no_database, no_schema
+
+
+def no_current_database_error(command: str) -> snowflake.connector.errors.ProgrammingError:
+    return snowflake.connector.errors.ProgrammingError(
+        msg=f"Cannot perform {command}. This session does not have a current database. Call 'USE DATABASE', or use a qualified name.",  # noqa: E501
+        errno=90105,
+        sqlstate="22000",
+    )
+
+
+def no_current_schema_error(command: str) -> snowflake.connector.errors.ProgrammingError:
+    return snowflake.connector.errors.ProgrammingError(
+        msg=f"Cannot perform {command}. This session does not have a current schema. Call 'USE SCHEMA', or use a qualified name.",  # noqa: E501
+        errno=90106,
+        sqlstate="22000",
+    )
 
 
 def _relevant_tables(expression: Expr) -> list[exp.Table]:

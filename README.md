@@ -100,6 +100,12 @@ fakesnow -s
 
 By default the server listens on a random available port. Use `-p` to specify a port.
 
+By default databases are in-memory. Use `--db_path` to persist them in an existing directory:
+
+```
+fakesnow -s --db_path databases/
+```
+
 Using docker, fakesnow server is configured to run on port 64616:
 
 ```shell
@@ -133,7 +139,15 @@ with fakesnow.server(port=12345) as conn_kwargs:
     ...
 ```
 
-By default, the server uses a single in-memory database for its lifetime. To configure database persistence or isolation:
+By default, the server uses a single in-memory database for its lifetime. To persist databases in an existing directory:
+
+```python
+# Databases will be saved to the "databases/" directory
+with fakesnow.server(db_path="databases/"):
+    ...
+```
+
+A connection can choose its own database path with the `FAKESNOW_DB_PATH` session parameter, which overrides `db_path`. Connections with the same path share databases:
 
 ```python
 # Databases will be saved to the "databases/" directory
@@ -218,6 +232,40 @@ static final GenericContainer<?> fakesnow =
 
 String url = "jdbc:snowflake://" + fakesnow.getHost() + ":" + fakesnow.getMappedPort(64616)
     + "/?ssl=off&account=fakesnow&db=db1&schema=schema1";
+```
+
+#### Connecting from dbt
+
+Point a [dbt-snowflake](https://docs.getdbt.com/docs/core/connect-data-platform/snowflake-setup) profile at `fakesnow -s`:
+
+```yaml
+my_project:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: fakesnow
+      user: fake
+      password: snow
+      database: dbt_db
+      schema: analytics
+      host: localhost
+      port: <port number from server startup>
+      protocol: http
+      threads: 4
+```
+
+Running models in parallel with `threads` greater than 1 is supported, both against the server and in-process.
+
+Or run dbt in-process with [`dbtRunner`](https://docs.getdbt.com/reference/programmatic-invocations) inside `fakesnow.patch()`, in which case `host`, `port` and `protocol` aren't needed:
+
+```python
+import fakesnow
+from dbt.cli.main import dbtRunner
+
+with fakesnow.patch():
+    result = dbtRunner().invoke(["build"])
+    assert result.success
 ```
 
 ### pytest fixtures
@@ -307,6 +355,7 @@ Partially supported:
 - Stages and PUT
 - Named file formats
 - `COPY INTO` from S3 sources and stages, see [COPY INTO](#copy-into)
+- Tasks and task graphs, see [Tasks](#tasks)
 
 Not yet implemented:
 
@@ -323,6 +372,22 @@ For more detail see the [test suite](tests/).
 ## COPY INTO
 
 `COPY INTO` can be used from S3 sources and stages. By default the standard AWS credential chain will be used. If you are getting an HTTP 403 or need to provide alternative S3 credentials you can use the duckdb [CREATE SECRET](https://duckdb.org/docs/stable/extensions/httpfs/s3api) statement. For an example of creating a secret to use a moto S3 endpoint see `s3_client` in [conftest.py](tests/conftest.py#L80)
+
+## Tasks
+
+Tasks and task graphs are supported: `CREATE [OR REPLACE | OR ALTER] TASK` (including `CLONE`), `ALTER TASK`, `DROP TASK`, `SHOW [TERSE] TASKS`, `DESCRIBE TASK`, `SYSTEM$TASK_DEPENDENTS_ENABLE`, the `SYSTEM$` task functions (such as `SYSTEM$SET_RETURN_VALUE` and `SYSTEM$GET_PREDECESSOR_RETURN_VALUE`) and the `TASK_HISTORY`, `COMPLETE_TASK_GRAPHS` and `TASK_DEPENDENTS` table functions in `INFORMATION_SCHEMA`. Snowflake's graph rules (suspended root, predecessors, finalizers, cycles and limits) are enforced.
+
+`EXECUTE TASK` (optionally `USING CONFIG`) is synchronous: it returns after the whole graph, finalizer included, has run. Each task runs in its own session, and a failing task is recorded in the task history rather than raising. It doesn't commit an open transaction, and the tasks don't see its uncommitted writes, so commit first if the tasks need to read them. `ALTER TASK` and `DROP TASK` commit an open transaction, as in Snowflake.
+
+Not supported:
+
+- A scheduler. `SCHEDULE` is stored, but tasks never run on their own
+- Asynchronous `EXECUTE TASK`
+- `CALL` and Snowflake Scripting task bodies. In particular `CALL SYSTEM$SET_RETURN_VALUE(...)` isn't supported, use `SELECT SYSTEM$SET_RETURN_VALUE(...)` instead
+- `EXECUTE TASK ... RETRY LAST` and automatic retries
+- `USER_TASK_TIMEOUT_MS` is not enforced
+- Stream-triggered tasks
+- Notification integrations are stored but never called
 
 ## Contributing
 

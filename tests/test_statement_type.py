@@ -3,6 +3,8 @@ import sqlglot
 from sqlglot import Expr
 
 import fakesnow.statement_type as statement_type
+import fakesnow.tasks
+from fakesnow.dialect import parse_one
 
 
 def parse(s: str) -> Expr:
@@ -64,3 +66,14 @@ def test_statement_type_id_tcl() -> None:
 
 def test_statement_type_id_unknown() -> None:
     assert type_id("put file:///tmp/customers.csv @stage1") == statement_type.UNKNOWN
+
+
+def test_statement_type_id_task_statements() -> None:
+    def task_type_id(s: str) -> int:
+        return statement_type.statement_type_id(fakesnow.tasks.task_statement(parse_one(s)))
+
+    assert task_type_id("create task t1 as select 1") == statement_type.DDL
+    assert task_type_id("alter task t1 resume") == statement_type.DDL
+    assert task_type_id("drop task t1") == statement_type.DDL
+    assert task_type_id("show tasks") == statement_type.SHOW
+    assert task_type_id("execute task t1") == statement_type.UNKNOWN

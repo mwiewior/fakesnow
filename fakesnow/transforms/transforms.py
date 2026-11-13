@@ -687,12 +687,12 @@ def grant_revoke(
             database, schema = (parts[0], parts[1]) if len(parts) > 1 else (current_database, parts[0])
         else:
             database, schema = parts[0], None
-        (count,) = duck_conn.execute(
+        [(count,)] = duck_conn.execute(
             "SELECT count(*) FROM information_schema.tables WHERE table_catalog = ? AND table_type = ? "
             "AND table_schema NOT IN ('information_schema', '_fs_information_schema') "
             "AND (? IS NULL OR table_schema = ?)",
             [database, table_type, schema, schema],
-        ).fetchone()  # type: ignore[misc]
+        ).fetchall()
     return sqlglot.parse_one(f"SELECT 'Statement executed successfully. {count} objects affected.' AS status")
 
 

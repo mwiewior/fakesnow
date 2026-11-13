@@ -118,8 +118,8 @@ def swap_table(
         # a temporary object shadows a permanent one of the same name
         kind = temporaries.kind(name, catalog, schema) if catalog and schema else None
         temporary.append(bool(kind))
-        if not kind and (row := duck_conn.execute(_KIND_SQL, [catalog, schema, name]).fetchone()):
-            kind = row[0]
+        if not kind and (rows := duck_conn.execute(_KIND_SQL, [catalog, schema, name]).fetchall()):
+            kind = rows[0][0]
         if kind and kind != "TABLE":
             # duckdb would rename a view as though it were a table
             raise snowflake.connector.errors.ProgrammingError(

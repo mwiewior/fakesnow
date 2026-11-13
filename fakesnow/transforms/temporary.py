@@ -13,7 +13,7 @@ _SCHEMA_EXISTS_SQL = """
 
 def check_schema_exists(duck_conn: DuckDBPyConnection, database: str | None, schema: str | None) -> None:
     """Raise Snowflake's error if the schema doesn't exist."""
-    if not duck_conn.execute(_SCHEMA_EXISTS_SQL, [database, schema]).fetchone():
+    if not duck_conn.execute(_SCHEMA_EXISTS_SQL, [database, schema]).fetchall():
         raise snowflake.connector.errors.ProgrammingError(
             msg=f"SQL compilation error:\nSchema '{database}.{schema}' does not exist or not authorized.",
             errno=2003,

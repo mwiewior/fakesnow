@@ -1,7 +1,7 @@
 [project]
 name = "fakesnow"
 description = "Fake Snowflake Connector for Python. Run, mock and test Snowflake DB locally."
-version = "0.12.0"
+version = "0.12.1"
 readme = "README.md"
 license = { file = "LICENSE" }
 classifiers = ["License :: OSI Approved :: MIT License"]
@@ -83,6 +83,8 @@ testpaths = ["tests"]
 filterwarnings = [
     "error::pytest.PytestUnhandledThreadExceptionWarning",
     "ignore::pytest.PytestUnknownMarkWarning",
+    # fail on warnings caused by fakesnow, eg: duckdb's extra copy warning, so users don't see them
+    "error::UserWarning:fakesnow.*",
 ]
 
 [tool.ruff]

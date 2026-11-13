@@ -90,7 +90,7 @@ class FakeSnowflakeConnection:
             and not duck_conn.execute(
                 f"""select * from information_schema.schemata
                 where upper(catalog_name) = '{self.database}'"""
-            ).fetchone()
+            ).fetchall()
         ):
             if self.db_path:
                 # raise a helpful error message when directory doesn't exist so users don't think
@@ -115,7 +115,7 @@ class FakeSnowflakeConnection:
             and not duck_conn.execute(
                 f"""select * from information_schema.schemata
                 where upper(catalog_name) = '{self.database}' and upper(schema_name) = '{self._schema}'"""
-            ).fetchone()
+            ).fetchall()
         ):
             duck_conn.execute(f"CREATE SCHEMA {self.database}.{self._schema}")
             self.owners.record(duck_conn, "SCHEMA", [self.database, self._schema], self.role)
@@ -127,7 +127,7 @@ class FakeSnowflakeConnection:
             and duck_conn.execute(
                 f"""select * from information_schema.schemata
                 where upper(catalog_name) = '{self.database}' and upper(schema_name) = '{self._schema}'"""
-            ).fetchone()
+            ).fetchall()
         ):
             duck_conn.execute(f"SET schema='{self.database}.{self._schema}'")
             self.database_set = True
@@ -138,7 +138,7 @@ class FakeSnowflakeConnection:
             and duck_conn.execute(
                 f"""select * from information_schema.schemata
                 where upper(catalog_name) = '{self.database}'"""
-            ).fetchone()
+            ).fetchall()
         ):
             duck_conn.execute(f"SET schema='{self.database}.main'")
             self.database_set = True

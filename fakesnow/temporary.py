@@ -78,10 +78,10 @@ class TemporaryObjects:
         if not self._owners:
             return None
         sql = f"SELECT oid, kind FROM ({_LIVE_SQL}) AS live(name, oid, kind) WHERE name = ?"
-        live = self._duck_conn.execute(sql, [name]).fetchone()
-        if not live or (owner := self._owners.get(live[0])) is None:
+        rows = self._duck_conn.execute(sql, [name]).fetchall()
+        if not rows or (owner := self._owners.get(rows[0][0])) is None:
             return None
-        return live[0], owner, live[1]
+        return rows[0][0], owner, rows[0][1]
 
 
 class LoadedFiles:
@@ -93,7 +93,7 @@ class LoadedFiles:
 
     def __contains__(self, file: str) -> bool:
         sql = f"SELECT 1 FROM temp.main.{_LOAD_HISTORY} WHERE table_oid = ? AND file_name = ?"
-        return self._duck_conn.execute(sql, [self._table_oid, file]).fetchone() is not None
+        return bool(self._duck_conn.execute(sql, [self._table_oid, file]).fetchall())
 
     def add(self, file: str) -> None:
         self._duck_conn.execute(f"INSERT INTO temp.main.{_LOAD_HISTORY} VALUES (?, ?)", [self._table_oid, file])

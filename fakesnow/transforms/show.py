@@ -394,12 +394,12 @@ def show_grants(
     temporary = None
     if kind == "DATABASE":
         exists_sql = "SELECT 1 FROM _fs_global._fs_information_schema._fs_show_databases WHERE name = ?"
-        exists = duck_conn.execute(exists_sql, names).fetchone() is not None
+        exists = bool(duck_conn.execute(exists_sql, names).fetchall())
     elif kind == "SCHEMA":
         exists_sql = (
             "SELECT 1 FROM _fs_global._fs_information_schema._fs_show_schemas WHERE database_name = ? AND name = ?"
         )
-        exists = duck_conn.execute(exists_sql, names).fetchone() is not None
+        exists = bool(duck_conn.execute(exists_sql, names).fetchall())
     else:
         # temporary tables and views are kept out of the show views
         temporary = temporaries.kind(names[2], names[0], names[1])

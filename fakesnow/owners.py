@@ -50,5 +50,5 @@ class Owners:
 
 
 def _oid(duck_conn: DuckDBPyConnection, kind: str, names: list[str]) -> int | None:
-    row = duck_conn.execute(_OID_SQL[kind], names).fetchone()
-    return row[0] if row else None
+    rows = duck_conn.execute(_OID_SQL[kind], names).fetchall()
+    return rows[0][0] if rows else None
